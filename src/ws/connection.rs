@@ -1,0 +1,453 @@
+//! One websocket connection to the Polymarket market channel.
+//!
+//! A connection owns the books of its symbols and is the only writer of
+//! their messages, so books and output stay consistent without locks. It
+//! keeps the socket alive with `PING`, reconnects with backoff, and recovers
+//! a symbol whenever its book can no longer be trusted:
+//!
+//! | Trigger | Recovery |
+//! | --- | --- |
+//! | socket closed, error, or no `PONG` within `pong_timeout` | reconnect; drop all books; resubscribe everything |
+//! | frame that does not decode | drop all books; unsubscribe + subscribe everything |
+//! | invalid level change for a symbol | drop that book; unsubscribe + subscribe the symbol |
+//!
+//! While a symbol has no book, its level changes are skipped (and counted):
+//! a reader would have no baseline to apply them to. The next `book` the
+//! exchange sends becomes the new baseline and is written as a snapshot.
+
+use std::collections::BTreeSet;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
+use chrono::{DateTime, Utc};
+use futures_util::{SinkExt, StreamExt};
+use tokio::net::TcpStream;
+use tokio::sync::{mpsc, watch};
+use tokio::time::Instant;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, info, warn};
+
+use crate::books::{Books, BooksError};
+use crate::exchange::{Event, polymarket};
+use crate::writer::{OutSender, WriterGone};
+
+type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+#[derive(Debug, Clone)]
+pub struct ConnectionConfig {
+    pub url: String,
+    pub ping_interval: Duration,
+    pub pong_timeout: Duration,
+    pub connect_timeout: Duration,
+    pub backoff_min: Duration,
+    pub backoff_max: Duration,
+    /// A session shorter than this does not reset the backoff, so a server
+    /// that accepts and immediately drops us is not hammered.
+    pub stable_after: Duration,
+    /// Symbols per subscribe/unsubscribe message.
+    pub subscribe_batch: usize,
+}
+
+impl Default for ConnectionConfig {
+    fn default() -> Self {
+        Self {
+            url: polymarket::WS_URL.to_owned(),
+            ping_interval: Duration::from_secs(10),
+            pong_timeout: Duration::from_secs(30),
+            connect_timeout: Duration::from_secs(10),
+            backoff_min: Duration::from_millis(500),
+            backoff_max: Duration::from_secs(30),
+            stable_after: Duration::from_secs(30),
+            subscribe_batch: 500,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Command {
+    Add(Vec<String>),
+    Remove(Vec<String>),
+}
+
+/// Per-connection counters, readable while the connection runs.
+#[derive(Debug, Default)]
+pub struct ConnStats {
+    pub connects: AtomicU64,
+    pub disconnects: AtomicU64,
+    pub frames: AtomicU64,
+    pub books: AtomicU64,
+    pub levels: AtomicU64,
+    /// Exchange books that disagreed with the local book (a missed change).
+    pub mismatched_books: AtomicU64,
+    pub mismatched_levels: AtomicU64,
+    /// Level changes skipped because the symbol had no baseline book.
+    pub skipped_no_baseline: AtomicU64,
+    pub decode_errors: AtomicU64,
+    pub resyncs: AtomicU64,
+    pub ignored: AtomicU64,
+    pub minute_snapshots: AtomicU64,
+}
+
+fn inc(counter: &AtomicU64) {
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+pub struct Connection {
+    id: usize,
+    cfg: ConnectionConfig,
+    symbols: BTreeSet<String>,
+    books: Books,
+    out: OutSender,
+    stats: Arc<ConnStats>,
+    /// Where `new_market` / `market_resolved` go; only one connection gets a
+    /// sender, since these events are broadcast to every socket.
+    discovery: Option<mpsc::UnboundedSender<Event>>,
+    ticks_open: bool,
+}
+
+enum SessionEnd {
+    Shutdown,
+    Lost(String),
+}
+
+/// Why a frame handler stopped the session.
+enum Stop {
+    Lost(String),
+    WriterGone,
+}
+
+impl From<WriterGone> for Stop {
+    fn from(_: WriterGone) -> Self {
+        Self::WriterGone
+    }
+}
+
+impl Connection {
+    pub fn new(
+        id: usize,
+        cfg: ConnectionConfig,
+        out: OutSender,
+        stats: Arc<ConnStats>,
+        discovery: Option<mpsc::UnboundedSender<Event>>,
+    ) -> Self {
+        Self {
+            id,
+            cfg,
+            symbols: BTreeSet::new(),
+            books: Books::new(),
+            out,
+            stats,
+            discovery,
+            ticks_open: true,
+        }
+    }
+
+    /// Runs until `shutdown` is cancelled or the command channel closes.
+    /// Returns `Err` only if the writer is gone, which is fatal for the whole
+    /// collector.
+    pub async fn run(
+        mut self,
+        mut cmds: mpsc::UnboundedReceiver<Command>,
+        mut ticks: watch::Receiver<DateTime<Utc>>,
+        shutdown: CancellationToken,
+    ) -> Result<(), WriterGone> {
+        let mut backoff = self.cfg.backoff_min;
+        loop {
+            if shutdown.is_cancelled() {
+                return Ok(());
+            }
+            if self.symbols.is_empty() {
+                // Nothing to subscribe to; wait for work without a socket.
+                tokio::select! {
+                    _ = shutdown.cancelled() => return Ok(()),
+                    cmd = cmds.recv() => match cmd {
+                        Some(cmd) => { self.apply_command_offline(cmd); continue; }
+                        None => return Ok(()),
+                    },
+                }
+            }
+
+            let connect = tokio::time::timeout(
+                self.cfg.connect_timeout,
+                tokio_tungstenite::connect_async(self.cfg.url.as_str()),
+            );
+            let connected = tokio::select! {
+                _ = shutdown.cancelled() => return Ok(()),
+                r = connect => r,
+            };
+            match connected {
+                Ok(Ok((ws, _))) => {
+                    inc(&self.stats.connects);
+                    info!(conn = self.id, symbols = self.symbols.len(), "connected");
+                    let started = Instant::now();
+                    let end = self.session(ws, &mut cmds, &mut ticks, &shutdown).await;
+                    // A new session starts from fresh exchange books.
+                    self.books = Books::new();
+                    match end {
+                        Ok(SessionEnd::Shutdown) => return Ok(()),
+                        Ok(SessionEnd::Lost(reason)) => {
+                            inc(&self.stats.disconnects);
+                            warn!(conn = self.id, %reason, "connection lost");
+                            if started.elapsed() >= self.cfg.stable_after {
+                                backoff = self.cfg.backoff_min;
+                            }
+                        }
+                        Err(WriterGone) => return Err(WriterGone),
+                    }
+                }
+                Ok(Err(e)) => warn!(conn = self.id, error = %e, "connect failed"),
+                Err(_) => warn!(conn = self.id, "connect timed out"),
+            }
+
+            debug!(conn = self.id, ?backoff, "reconnecting after backoff");
+            tokio::select! {
+                _ = shutdown.cancelled() => return Ok(()),
+                _ = tokio::time::sleep(backoff) => {}
+            }
+            backoff = (backoff * 2).min(self.cfg.backoff_max);
+        }
+    }
+
+    fn apply_command_offline(&mut self, cmd: Command) {
+        match cmd {
+            Command::Add(symbols) => self.symbols.extend(symbols),
+            Command::Remove(symbols) => {
+                for s in &symbols {
+                    self.symbols.remove(s);
+                    self.books.remove(s);
+                }
+            }
+        }
+    }
+
+    async fn session(
+        &mut self,
+        mut ws: Ws,
+        cmds: &mut mpsc::UnboundedReceiver<Command>,
+        ticks: &mut watch::Receiver<DateTime<Utc>>,
+        shutdown: &CancellationToken,
+    ) -> Result<SessionEnd, WriterGone> {
+        let all: Vec<String> = self.symbols.iter().cloned().collect();
+        if let Err(reason) = self.send_subscribe(&mut ws, &all, true).await {
+            return Ok(SessionEnd::Lost(reason));
+        }
+        let mut ping = tokio::time::interval(self.cfg.ping_interval);
+        ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ping.tick().await; // the first tick is immediate
+        let mut last_pong = Instant::now();
+
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    let _ = ws.close(None).await;
+                    return Ok(SessionEnd::Shutdown);
+                }
+                frame = ws.next() => {
+                    // Stamp first, before any parsing.
+                    let received_at = Utc::now();
+                    let text = match frame {
+                        None => return Ok(SessionEnd::Lost("stream ended".into())),
+                        Some(Err(e)) => return Ok(SessionEnd::Lost(e.to_string())),
+                        Some(Ok(Message::Text(text))) => text,
+                        Some(Ok(Message::Close(frame))) => {
+                            return Ok(SessionEnd::Lost(format!("closed by server: {frame:?}")));
+                        }
+                        Some(Ok(_)) => continue, // protocol pings are answered by tungstenite
+                    };
+                    inc(&self.stats.frames);
+                    match self.on_text(&mut ws, &text, received_at, &mut last_pong).await {
+                        Ok(()) => {}
+                        Err(Stop::Lost(reason)) => return Ok(SessionEnd::Lost(reason)),
+                        Err(Stop::WriterGone) => return Err(WriterGone),
+                    }
+                }
+                _ = ping.tick() => {
+                    if last_pong.elapsed() > self.cfg.pong_timeout {
+                        return Ok(SessionEnd::Lost(format!(
+                            "no PONG for {:?}", last_pong.elapsed()
+                        )));
+                    }
+                    if let Err(e) = ws.send(Message::text(polymarket::PING)).await {
+                        return Ok(SessionEnd::Lost(e.to_string()));
+                    }
+                }
+                cmd = cmds.recv() => {
+                    let result = match cmd {
+                        None => {
+                            let _ = ws.close(None).await;
+                            return Ok(SessionEnd::Shutdown);
+                        }
+                        Some(Command::Add(symbols)) => {
+                            let new: Vec<String> = symbols
+                                .into_iter()
+                                .filter(|s| self.symbols.insert(s.clone()))
+                                .collect();
+                            self.send_subscribe(&mut ws, &new, false).await
+                        }
+                        Some(Command::Remove(symbols)) => {
+                            let gone: Vec<String> = symbols
+                                .into_iter()
+                                .filter(|s| {
+                                    self.books.remove(s);
+                                    self.symbols.remove(s)
+                                })
+                                .collect();
+                            self.send_batched(&mut ws, &gone, polymarket::encode_unsubscribe).await
+                        }
+                    };
+                    if let Err(reason) = result {
+                        return Ok(SessionEnd::Lost(reason));
+                    }
+                }
+                changed = ticks.changed(), if self.ticks_open => {
+                    if changed.is_err() {
+                        self.ticks_open = false;
+                        continue;
+                    }
+                    let emitted_at = Utc::now();
+                    for msg in self.books.minute_snapshots(emitted_at) {
+                        self.out.send(msg)?;
+                        inc(&self.stats.minute_snapshots);
+                    }
+                }
+            }
+        }
+    }
+
+    async fn on_text(
+        &mut self,
+        ws: &mut Ws,
+        text: &str,
+        received_at: DateTime<Utc>,
+        last_pong: &mut Instant,
+    ) -> Result<(), Stop> {
+        let events = match polymarket::decode(text) {
+            Ok(events) => events,
+            Err(error) => {
+                inc(&self.stats.decode_errors);
+                let sample: String = text.chars().take(200).collect();
+                warn!(conn = self.id, %error, frame = %sample, "undecodable frame; resyncing all symbols");
+                let all: Vec<String> = self.symbols.iter().cloned().collect();
+                return self.resync(ws, &all).await;
+            }
+        };
+        for event in events {
+            match event {
+                Event::Book {
+                    symbol,
+                    bids,
+                    asks,
+                    exchange_ts,
+                    ..
+                } => {
+                    if !self.symbols.contains(&symbol) {
+                        continue; // late message for a removed symbol
+                    }
+                    match self.books.apply_snapshot(&symbol, bids, asks, exchange_ts, received_at) {
+                        Ok(applied) => {
+                            inc(&self.stats.books);
+                            if let Some(mismatches) = &applied.mismatches
+                                && !mismatches.is_empty()
+                            {
+                                inc(&self.stats.mismatched_books);
+                                self.stats
+                                    .mismatched_levels
+                                    .fetch_add(mismatches.len() as u64, Ordering::Relaxed);
+                                warn!(
+                                    conn = self.id,
+                                    %symbol,
+                                    levels = mismatches.len(),
+                                    first = ?mismatches.first(),
+                                    "exchange book differs from local book"
+                                );
+                            }
+                            self.out.send(applied.msg)?;
+                        }
+                        Err(error) => {
+                            warn!(conn = self.id, %error, "invalid exchange book; resyncing");
+                            self.resync(ws, std::slice::from_ref(&symbol)).await?;
+                        }
+                    }
+                }
+                Event::Level {
+                    symbol,
+                    side,
+                    price,
+                    quantity,
+                    exchange_ts,
+                    ..
+                } => {
+                    if !self.symbols.contains(&symbol) {
+                        continue;
+                    }
+                    match self.books.apply_level(&symbol, side, price, quantity, exchange_ts, received_at) {
+                        Ok(msg) => {
+                            inc(&self.stats.levels);
+                            self.out.send(msg)?;
+                        }
+                        Err(BooksError::NoBaseline { .. }) => inc(&self.stats.skipped_no_baseline),
+                        Err(error) => {
+                            warn!(conn = self.id, %error, "invalid level change; resyncing");
+                            self.resync(ws, std::slice::from_ref(&symbol)).await?;
+                        }
+                    }
+                }
+                Event::Pong => *last_pong = Instant::now(),
+                event @ (Event::MarketAdded { .. } | Event::MarketResolved { .. }) => {
+                    if let Some(tx) = &self.discovery {
+                        let _ = tx.send(event);
+                    }
+                }
+                Event::TickSizeChanged { symbol, old, new } => {
+                    info!(conn = self.id, %symbol, %old, %new, "tick size changed");
+                }
+                Event::Ignored { .. } => inc(&self.stats.ignored),
+            }
+        }
+        Ok(())
+    }
+
+    /// Drops the books of `symbols` and asks the exchange for fresh ones.
+    async fn resync(&mut self, ws: &mut Ws, symbols: &[String]) -> Result<(), Stop> {
+        inc(&self.stats.resyncs);
+        for s in symbols {
+            self.books.remove(s);
+        }
+        self.send_batched(ws, symbols, polymarket::encode_unsubscribe)
+            .await
+            .map_err(Stop::Lost)?;
+        self.send_subscribe(ws, symbols, false).await.map_err(Stop::Lost)
+    }
+
+    async fn send_subscribe(&self, ws: &mut Ws, symbols: &[String], initial: bool) -> Result<(), String> {
+        if symbols.is_empty() {
+            return Ok(());
+        }
+        let (first, rest) = symbols.split_at(symbols.len().min(self.cfg.subscribe_batch));
+        let msg = if initial {
+            polymarket::encode_initial_subscribe(first)
+        } else {
+            polymarket::encode_subscribe(first)
+        };
+        ws.send(Message::text(msg)).await.map_err(|e| e.to_string())?;
+        self.send_batched(ws, rest, polymarket::encode_subscribe).await
+    }
+
+    async fn send_batched(
+        &self,
+        ws: &mut Ws,
+        symbols: &[String],
+        encode: fn(&[String]) -> String,
+    ) -> Result<(), String> {
+        for chunk in symbols.chunks(self.cfg.subscribe_batch) {
+            ws.send(Message::text(encode(chunk))).await.map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests;
