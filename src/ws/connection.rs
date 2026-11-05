@@ -14,14 +14,17 @@
 //! While a symbol has no book, its level changes are skipped (and counted):
 //! a reader would have no baseline to apply them to. The next `book` the
 //! exchange sends becomes the new baseline and is written as a snapshot.
+//! Polymarket sends no `book` for a token without orders, so a symbol still
+//! without one `empty_book_after` its subscription gets an empty baseline.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
+use indexmap::IndexSet;
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
@@ -54,6 +57,18 @@ pub struct ConnectionConfig {
     /// overflows the server's send buffer for the socket, and it closes the
     /// connection with "slow consumer: send buffer full" (seen in M4).
     pub subscribe_pace: Duration,
+    /// A symbol with no `book` this long after its subscription was sent is
+    /// taken to have an empty book. Polymarket sends no `book` for tokens
+    /// without orders (REST answers 404 for them); their first order arrives
+    /// as a `price_change`, which needs a baseline. Books arrive within 0.74 s
+    /// of subscribing (p99, 2000 tokens, M5), so 5 s leaves a wide margin; if
+    /// a book does come later, it is a checkpoint and corrects the guess.
+    pub empty_book_after: Duration,
+    /// A level change for a symbol still waiting for its `book` this long
+    /// after subscribing means the book is empty: books arrive within 0.74 s
+    /// (p99). The change is then applied to an empty baseline at once,
+    /// instead of being skipped until `empty_book_after`.
+    pub empty_book_on_change_after: Duration,
 }
 
 impl Default for ConnectionConfig {
@@ -68,6 +83,8 @@ impl Default for ConnectionConfig {
             stable_after: Duration::from_secs(30),
             subscribe_batch: 100,
             subscribe_pace: Duration::from_millis(250),
+            empty_book_after: Duration::from_secs(5),
+            empty_book_on_change_after: Duration::from_millis(1500),
         }
     }
 }
@@ -95,6 +112,8 @@ pub struct ConnStats {
     pub resyncs: AtomicU64,
     pub ignored: AtomicU64,
     pub minute_snapshots: AtomicU64,
+    /// Symbols given an empty baseline because no `book` arrived in time.
+    pub assumed_empty: AtomicU64,
     /// Bytes of text frames received.
     pub bytes: AtomicU64,
     /// Time spent handling frames (decode, books, queueing output), in µs.
@@ -110,7 +129,9 @@ fn inc(counter: &AtomicU64) {
 pub struct Connection {
     id: usize,
     cfg: ConnectionConfig,
-    symbols: BTreeSet<String>,
+    /// In the order they were added, so a market's tokens (added together)
+    /// stay in the same subscription batch after a reconnect.
+    symbols: IndexSet<String>,
     books: Books,
     out: OutSender,
     stats: Arc<ConnStats>,
@@ -123,6 +144,9 @@ pub struct Connection {
     pending: VecDeque<String>,
     /// Whether the current socket has sent its initial subscription.
     initial_sent: bool,
+    /// Symbols subscribed on the current socket that have no `book` yet, with
+    /// the time their subscription was sent.
+    awaiting_book: HashMap<String, Instant>,
 }
 
 enum SessionEnd {
@@ -153,7 +177,7 @@ impl Connection {
         Self {
             id,
             cfg,
-            symbols: BTreeSet::new(),
+            symbols: IndexSet::new(),
             books: Books::new(),
             out,
             stats,
@@ -161,6 +185,7 @@ impl Connection {
             ticks_open: true,
             pending: VecDeque::new(),
             initial_sent: false,
+            awaiting_book: HashMap::new(),
         }
     }
 
@@ -235,7 +260,7 @@ impl Connection {
             Command::Add(symbols) => self.symbols.extend(symbols),
             Command::Remove(symbols) => {
                 for s in &symbols {
-                    self.symbols.remove(s);
+                    self.symbols.shift_remove(s);
                     self.books.remove(s);
                 }
             }
@@ -251,6 +276,9 @@ impl Connection {
     ) -> Result<SessionEnd, WriterGone> {
         self.pending = self.symbols.iter().cloned().collect();
         self.initial_sent = false;
+        self.awaiting_book.clear();
+        let mut empty_check = tokio::time::interval(Duration::from_secs(1));
+        empty_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // The first tick is immediate, so the first batch goes out at once.
         let mut pace = tokio::time::interval(self.cfg.subscribe_pace);
         pace.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -295,6 +323,9 @@ impl Connection {
                         return Ok(SessionEnd::Lost(reason));
                     }
                 }
+                _ = empty_check.tick(), if !self.awaiting_book.is_empty() => {
+                    self.assume_empty_books()?;
+                }
                 _ = ping.tick() => {
                     if last_pong.elapsed() > self.cfg.pong_timeout {
                         return Ok(SessionEnd::Lost(format!(
@@ -324,7 +355,8 @@ impl Connection {
                                 .into_iter()
                                 .filter(|s| {
                                     self.books.remove(s);
-                                    self.symbols.remove(s)
+                                    self.awaiting_book.remove(s);
+                                    self.symbols.shift_remove(s)
                                 })
                                 .collect();
                             self.pending.retain(|p| !gone.contains(p));
@@ -379,6 +411,7 @@ impl Connection {
                     if !self.symbols.contains(&symbol) {
                         continue; // late message for a removed symbol
                     }
+                    self.awaiting_book.remove(&symbol);
                     match self.books.apply_snapshot(&symbol, bids, asks, exchange_ts, received_at) {
                         Ok(applied) => {
                             inc(&self.stats.books);
@@ -421,7 +454,30 @@ impl Connection {
                             inc(&self.stats.levels);
                             self.out.send(msg)?;
                         }
-                        Err(BooksError::NoBaseline { .. }) => inc(&self.stats.skipped_no_baseline),
+                        Err(BooksError::NoBaseline { .. }) => {
+                            let overdue = self
+                                .awaiting_book
+                                .get(&symbol)
+                                .is_some_and(|sent| sent.elapsed() >= self.cfg.empty_book_on_change_after);
+                            if !overdue {
+                                inc(&self.stats.skipped_no_baseline);
+                                continue;
+                            }
+                            self.assume_empty(&symbol)?;
+                            let msg = self
+                                .books
+                                .apply_level(&symbol, side, price, quantity, exchange_ts, received_at);
+                            match msg {
+                                Ok(msg) => {
+                                    inc(&self.stats.levels);
+                                    self.out.send(msg)?;
+                                }
+                                Err(error) => {
+                                    warn!(conn = self.id, %error, "invalid level change; resyncing");
+                                    self.resync(ws, std::slice::from_ref(&symbol)).await?;
+                                }
+                            }
+                        }
                         Err(error) => {
                             warn!(conn = self.id, %error, "invalid level change; resyncing");
                             self.resync(ws, std::slice::from_ref(&symbol)).await?;
@@ -449,6 +505,7 @@ impl Connection {
         inc(&self.stats.resyncs);
         for s in symbols {
             self.books.remove(s);
+            self.awaiting_book.remove(s);
         }
         self.send_unsubscribe(ws, symbols).await.map_err(Stop::Lost)?;
         for s in symbols {
@@ -467,6 +524,10 @@ impl Connection {
         if batch.is_empty() {
             return Ok(());
         }
+        let now = Instant::now();
+        for s in &batch {
+            self.awaiting_book.insert(s.clone(), now);
+        }
         let msg = if self.initial_sent {
             polymarket::encode_subscribe(&batch)
         } else {
@@ -474,6 +535,39 @@ impl Connection {
         };
         self.initial_sent = true;
         ws.send(Message::text(msg)).await.map_err(|e| e.to_string())
+    }
+
+    /// Gives every symbol whose `book` is overdue an empty baseline and
+    /// writes it as a snapshot. Its exchange timestamp is the local time,
+    /// since the exchange sent nothing.
+    fn assume_empty_books(&mut self) -> Result<(), WriterGone> {
+        let grace = self.cfg.empty_book_after;
+        let mut overdue: Vec<String> = self
+            .awaiting_book
+            .iter()
+            .filter(|(_, sent)| sent.elapsed() >= grace)
+            .map(|(s, _)| s.clone())
+            .collect();
+        overdue.sort_unstable();
+        for symbol in overdue {
+            self.assume_empty(&symbol)?;
+        }
+        Ok(())
+    }
+
+    /// Gives one symbol an empty baseline, unless it already has a book.
+    fn assume_empty(&mut self, symbol: &str) -> Result<(), WriterGone> {
+        self.awaiting_book.remove(symbol);
+        if self.books.contains(symbol) {
+            return Ok(());
+        }
+        let now = Utc::now();
+        let applied = self
+            .books
+            .apply_snapshot(symbol, [], [], now, now)
+            .expect("an empty book is always valid");
+        inc(&self.stats.assumed_empty);
+        self.out.send(applied.msg)
     }
 
     /// Unsubscribes at once (no book burst follows). Nothing to do before the

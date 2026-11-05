@@ -6,6 +6,7 @@ pub mod exchange;
 pub mod fixed;
 pub mod shard;
 pub mod util;
+pub mod validate;
 pub mod writer;
 pub mod ws;
 

@@ -194,6 +194,7 @@ fn log_stats(shards: &ShardManager) {
             decode_errors = s.decode_errors.load(Relaxed),
             resyncs = s.resyncs.load(Relaxed),
             minute_snapshots = s.minute_snapshots.load(Relaxed),
+            assumed_empty = s.assumed_empty.load(Relaxed),
             mb = s.bytes.load(Relaxed) / 1_000_000,
             busy_ms = s.busy_us.load(Relaxed) / 1000,
             max_frame_us = s.max_frame_us.load(Relaxed),

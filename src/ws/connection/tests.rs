@@ -33,6 +33,8 @@ fn fast_cfg(url: String) -> ConnectionConfig {
         stable_after: Duration::from_secs(60),
         subscribe_batch: 500,
         subscribe_pace: Duration::from_millis(5),
+        empty_book_after: Duration::from_secs(60),
+        empty_book_on_change_after: Duration::from_secs(60),
     }
 }
 
@@ -384,6 +386,92 @@ async fn removing_a_pending_symbol_cancels_its_subscription() {
             })
             .collect();
         assert_eq!(subscribed, ["A", "B"], "{log:?}");
+    }
+    h.finish().await;
+}
+
+#[tokio::test]
+async fn token_without_a_book_gets_an_empty_baseline_and_later_changes_apply() {
+    let (url, _log) = mock_server(|_, mut ws, log| async move {
+        next_text(&mut ws, &log, true).await;
+        send(&mut ws, BOOK_A).await; // B never gets a book: it has no orders
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        // B's first order arrives as a change.
+        send(&mut ws, CHANGE_B).await;
+        idle(ws, log).await;
+    })
+    .await;
+    let mut cfg = fast_cfg(url);
+    cfg.empty_book_after = Duration::from_millis(300);
+    let h = start(cfg, &["A", "B"]);
+    eventually("empty baseline for B", || h.get(|s| &s.assumed_empty) == 1).await;
+    eventually("B's change applied", || h.get(|s| &s.levels) == 1).await;
+    assert_eq!(h.get(|s| &s.skipped_no_baseline), 0);
+    let msgs = h.finish().await;
+    assert_eq!(kinds(&msgs), ["S:A", "S:B", "U:B:1000000"]);
+    let OutMsg::Snapshot(empty) = &msgs[1] else { panic!() };
+    assert!(empty.bids.is_empty() && empty.asks.is_empty());
+}
+
+#[tokio::test]
+async fn a_late_book_after_an_empty_guess_is_a_checkpoint() {
+    let book_b = BOOK_A.replace("\"A\"", "\"B\"");
+    let (url, _log) = mock_server(move |_, mut ws, log| {
+        let book_b = book_b.clone();
+        async move {
+            next_text(&mut ws, &log, true).await;
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            send(&mut ws, &book_b).await; // far later than the grace period
+            idle(ws, log).await;
+        }
+    })
+    .await;
+    let mut cfg = fast_cfg(url);
+    cfg.empty_book_after = Duration::from_millis(300);
+    let h = start(cfg, &["B"]);
+    eventually("late book", || h.get(|s| &s.books) == 1).await;
+    assert_eq!(h.get(|s| &s.assumed_empty), 1);
+    assert_eq!(h.get(|s| &s.mismatched_books), 1, "the wrong guess is caught");
+    let msgs = h.finish().await;
+    let OutMsg::Snapshot(last) = msgs.last().unwrap() else { panic!() };
+    assert_eq!(last.bids.len(), 1, "the exchange book replaces the guess");
+}
+
+#[tokio::test]
+async fn an_overdue_change_creates_the_empty_baseline_at_once() {
+    let (url, _log) = mock_server(|_, mut ws, log| async move {
+        next_text(&mut ws, &log, true).await;
+        send(&mut ws, CHANGE_B).await; // too early: B may still get a book
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        send(&mut ws, CHANGE_B).await; // overdue: B's book is empty
+        idle(ws, log).await;
+    })
+    .await;
+    let mut cfg = fast_cfg(url);
+    cfg.empty_book_on_change_after = Duration::from_millis(200);
+    let h = start(cfg, &["B"]);
+    eventually("second change applied", || h.get(|s| &s.levels) == 1).await;
+    assert_eq!(h.get(|s| &s.skipped_no_baseline), 1);
+    assert_eq!(h.get(|s| &s.assumed_empty), 1);
+    assert_eq!(kinds(&h.finish().await), ["S:B", "U:B:1000000"]);
+}
+
+#[tokio::test]
+async fn reconnect_resubscribes_in_insertion_order() {
+    let (url, log) = mock_server(|n, mut ws, log| async move {
+        next_text(&mut ws, &log, true).await;
+        if n == 0 {
+            return;
+        }
+        idle(ws, log).await;
+    })
+    .await;
+    let h = start(fast_cfg(url), &["z-yes", "z-no", "a-yes", "a-no"]);
+    eventually("second session subscribed", || log.lock().unwrap().len() == 2).await;
+    {
+        let log = log.lock().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&log[1]).unwrap();
+        assert_eq!(v["assets_ids"], serde_json::json!(["z-yes", "z-no", "a-yes", "a-no"]));
     }
     h.finish().await;
 }
