@@ -15,7 +15,7 @@
 //! a reader would have no baseline to apply them to. The next `book` the
 //! exchange sends becomes the new baseline and is written as a snapshot.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -49,6 +49,11 @@ pub struct ConnectionConfig {
     pub stable_after: Duration,
     /// Symbols per subscribe/unsubscribe message.
     pub subscribe_batch: usize,
+    /// Pause between subscribe messages. Each subscription makes the server
+    /// push a full book per symbol at once; sending them all together
+    /// overflows the server's send buffer for the socket, and it closes the
+    /// connection with "slow consumer: send buffer full" (seen in M4).
+    pub subscribe_pace: Duration,
 }
 
 impl Default for ConnectionConfig {
@@ -61,7 +66,8 @@ impl Default for ConnectionConfig {
             backoff_min: Duration::from_millis(500),
             backoff_max: Duration::from_secs(30),
             stable_after: Duration::from_secs(30),
-            subscribe_batch: 500,
+            subscribe_batch: 100,
+            subscribe_pace: Duration::from_millis(250),
         }
     }
 }
@@ -89,6 +95,12 @@ pub struct ConnStats {
     pub resyncs: AtomicU64,
     pub ignored: AtomicU64,
     pub minute_snapshots: AtomicU64,
+    /// Bytes of text frames received.
+    pub bytes: AtomicU64,
+    /// Time spent handling frames (decode, books, queueing output), in µs.
+    pub busy_us: AtomicU64,
+    /// Longest single frame handling time, in µs.
+    pub max_frame_us: AtomicU64,
 }
 
 fn inc(counter: &AtomicU64) {
@@ -106,6 +118,11 @@ pub struct Connection {
     /// sender, since these events are broadcast to every socket.
     discovery: Option<mpsc::UnboundedSender<Event>>,
     ticks_open: bool,
+    /// Symbols waiting to be subscribed on the current socket, sent one batch
+    /// per `subscribe_pace`.
+    pending: VecDeque<String>,
+    /// Whether the current socket has sent its initial subscription.
+    initial_sent: bool,
 }
 
 enum SessionEnd {
@@ -142,6 +159,8 @@ impl Connection {
             stats,
             discovery,
             ticks_open: true,
+            pending: VecDeque::new(),
+            initial_sent: false,
         }
     }
 
@@ -230,10 +249,11 @@ impl Connection {
         ticks: &mut watch::Receiver<DateTime<Utc>>,
         shutdown: &CancellationToken,
     ) -> Result<SessionEnd, WriterGone> {
-        let all: Vec<String> = self.symbols.iter().cloned().collect();
-        if let Err(reason) = self.send_subscribe(&mut ws, &all, true).await {
-            return Ok(SessionEnd::Lost(reason));
-        }
+        self.pending = self.symbols.iter().cloned().collect();
+        self.initial_sent = false;
+        // The first tick is immediate, so the first batch goes out at once.
+        let mut pace = tokio::time::interval(self.cfg.subscribe_pace);
+        pace.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut ping = tokio::time::interval(self.cfg.ping_interval);
         ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         ping.tick().await; // the first tick is immediate
@@ -258,10 +278,21 @@ impl Connection {
                         Some(Ok(_)) => continue, // protocol pings are answered by tungstenite
                     };
                     inc(&self.stats.frames);
-                    match self.on_text(&mut ws, &text, received_at, &mut last_pong).await {
+                    self.stats.bytes.fetch_add(text.len() as u64, Ordering::Relaxed);
+                    let busy = std::time::Instant::now();
+                    let result = self.on_text(&mut ws, &text, received_at, &mut last_pong).await;
+                    let us = busy.elapsed().as_micros() as u64;
+                    self.stats.busy_us.fetch_add(us, Ordering::Relaxed);
+                    self.stats.max_frame_us.fetch_max(us, Ordering::Relaxed);
+                    match result {
                         Ok(()) => {}
                         Err(Stop::Lost(reason)) => return Ok(SessionEnd::Lost(reason)),
                         Err(Stop::WriterGone) => return Err(WriterGone),
+                    }
+                }
+                _ = pace.tick(), if !self.pending.is_empty() => {
+                    if let Err(reason) = self.send_next_batch(&mut ws).await {
+                        return Ok(SessionEnd::Lost(reason));
                     }
                 }
                 _ = ping.tick() => {
@@ -281,11 +312,12 @@ impl Connection {
                             return Ok(SessionEnd::Shutdown);
                         }
                         Some(Command::Add(symbols)) => {
-                            let new: Vec<String> = symbols
-                                .into_iter()
-                                .filter(|s| self.symbols.insert(s.clone()))
-                                .collect();
-                            self.send_subscribe(&mut ws, &new, false).await
+                            for s in symbols {
+                                if self.symbols.insert(s.clone()) {
+                                    self.pending.push_back(s);
+                                }
+                            }
+                            Ok(())
                         }
                         Some(Command::Remove(symbols)) => {
                             let gone: Vec<String> = symbols
@@ -295,7 +327,8 @@ impl Connection {
                                     self.symbols.remove(s)
                                 })
                                 .collect();
-                            self.send_batched(&mut ws, &gone, polymarket::encode_unsubscribe).await
+                            self.pending.retain(|p| !gone.contains(p));
+                            self.send_unsubscribe(&mut ws, &gone).await
                         }
                     };
                     if let Err(reason) = result {
@@ -410,40 +443,49 @@ impl Connection {
         Ok(())
     }
 
-    /// Drops the books of `symbols` and asks the exchange for fresh ones.
+    /// Drops the books of `symbols` and asks the exchange for fresh ones:
+    /// unsubscribe now, subscribe again through the paced queue.
     async fn resync(&mut self, ws: &mut Ws, symbols: &[String]) -> Result<(), Stop> {
         inc(&self.stats.resyncs);
         for s in symbols {
             self.books.remove(s);
         }
-        self.send_batched(ws, symbols, polymarket::encode_unsubscribe)
-            .await
-            .map_err(Stop::Lost)?;
-        self.send_subscribe(ws, symbols, false).await.map_err(Stop::Lost)
+        self.send_unsubscribe(ws, symbols).await.map_err(Stop::Lost)?;
+        for s in symbols {
+            if !self.pending.contains(s) {
+                self.pending.push_back(s.clone());
+            }
+        }
+        Ok(())
     }
 
-    async fn send_subscribe(&self, ws: &mut Ws, symbols: &[String], initial: bool) -> Result<(), String> {
-        if symbols.is_empty() {
+    /// Sends the next batch of pending subscriptions. The first message on a
+    /// socket uses the initial format.
+    async fn send_next_batch(&mut self, ws: &mut Ws) -> Result<(), String> {
+        let n = self.pending.len().min(self.cfg.subscribe_batch);
+        let batch: Vec<String> = self.pending.drain(..n).collect();
+        if batch.is_empty() {
             return Ok(());
         }
-        let (first, rest) = symbols.split_at(symbols.len().min(self.cfg.subscribe_batch));
-        let msg = if initial {
-            polymarket::encode_initial_subscribe(first)
+        let msg = if self.initial_sent {
+            polymarket::encode_subscribe(&batch)
         } else {
-            polymarket::encode_subscribe(first)
+            polymarket::encode_initial_subscribe(&batch)
         };
-        ws.send(Message::text(msg)).await.map_err(|e| e.to_string())?;
-        self.send_batched(ws, rest, polymarket::encode_subscribe).await
+        self.initial_sent = true;
+        ws.send(Message::text(msg)).await.map_err(|e| e.to_string())
     }
 
-    async fn send_batched(
-        &self,
-        ws: &mut Ws,
-        symbols: &[String],
-        encode: fn(&[String]) -> String,
-    ) -> Result<(), String> {
+    /// Unsubscribes at once (no book burst follows). Nothing to do before the
+    /// socket's first subscription.
+    async fn send_unsubscribe(&self, ws: &mut Ws, symbols: &[String]) -> Result<(), String> {
+        if !self.initial_sent {
+            return Ok(());
+        }
         for chunk in symbols.chunks(self.cfg.subscribe_batch) {
-            ws.send(Message::text(encode(chunk))).await.map_err(|e| e.to_string())?;
+            ws.send(Message::text(polymarket::encode_unsubscribe(chunk)))
+                .await
+                .map_err(|e| e.to_string())?;
         }
         Ok(())
     }

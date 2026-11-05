@@ -11,12 +11,13 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-use engineering_challenge::discovery;
+use chrono::Utc;
+use engineering_challenge::clock;
+use engineering_challenge::discovery::{self, Diff, Poll, PollerConfig, Tracker, TrackerConfig};
 use engineering_challenge::exchange::Event;
 use engineering_challenge::shard::ShardManager;
 use engineering_challenge::writer::{self, Output};
 use engineering_challenge::ws::connection::ConnectionConfig;
-use engineering_challenge::{clock, exchange};
 
 #[derive(Parser, Debug)]
 #[command(about = "Records Polymarket order books in the challenge's SBE format")]
@@ -34,9 +35,18 @@ struct Args {
     #[arg(long)]
     max_markets: Option<usize>,
 
-    /// Read at most this many Gamma pages (100 markets each) at startup.
+    /// Read at most this many Gamma event pages (~1400 markets each) per full pass
+    /// (for testing). Default: all.
     #[arg(long)]
     max_pages: Option<usize>,
+
+    /// Minutes between full discovery passes.
+    #[arg(long, default_value_t = 30)]
+    full_every_mins: u64,
+
+    /// Seconds between incremental discovery polls.
+    #[arg(long, default_value_t = 30)]
+    recent_every_secs: u64,
 
     /// Writer channel capacity, in messages.
     #[arg(long, default_value_t = 1 << 16)]
@@ -87,23 +97,22 @@ async fn main() -> anyhow::Result<()> {
         Some(discovery_tx),
     );
 
-    let http = reqwest::Client::new();
-    let markets = tokio::select! {
-        _ = shutdown.cancelled() => None,
-        m = discovery::fetch_tradable(&http, discovery::GAMMA_URL, args.max_pages) => Some(m?),
-    };
-    if let Some(mut markets) = markets {
-        if let Some(max) = args.max_markets {
-            markets.truncate(max);
-        }
-        let added = shards.add(markets.into_iter().flat_map(|m| m.tokens));
-        info!(
-            markets = args.max_markets.map_or("all".to_owned(), |m| m.to_string()),
-            symbols = added,
-            connections = shards.connections().len(),
-            "subscribing"
-        );
-    }
+    let mut tracker = Tracker::new(TrackerConfig {
+        max_markets: args.max_markets,
+        ..TrackerConfig::default()
+    });
+    let (poll_tx, mut poll_rx) = mpsc::channel::<Poll>(64);
+    let poller = tokio::spawn(discovery::run_poller(
+        reqwest::Client::new(),
+        PollerConfig {
+            full_every: Duration::from_secs(args.full_every_mins * 60),
+            recent_every: Duration::from_secs(args.recent_every_secs),
+            full_max_pages: args.max_pages,
+            ..PollerConfig::default()
+        },
+        poll_tx,
+        shutdown.clone(),
+    ));
 
     let mut stats_every = tokio::time::interval(Duration::from_secs(args.stats_every));
     stats_every.tick().await;
@@ -117,10 +126,29 @@ async fn main() -> anyhow::Result<()> {
                 shutdown.cancel();
                 break;
             }
-            Some(event) = discovery_rx.recv() => log_discovery(&event),
-            _ = stats_every.tick() => log_stats(&shards),
+            Some(poll) = poll_rx.recv() => {
+                let source = match &poll {
+                    Poll::Full { .. } => "full",
+                    Poll::Recent { query, .. } => query,
+                };
+                let diff = tracker.apply(poll, Utc::now());
+                apply_diff(&mut shards, &tracker, source, diff);
+            }
+            Some(event) = discovery_rx.recv() => {
+                let diff = match &event {
+                    Event::MarketAdded { market, symbols } => tracker.market_added(market, symbols, Utc::now()),
+                    Event::MarketResolved { market, .. } => tracker.market_resolved(market, Utc::now()),
+                    _ => continue,
+                };
+                apply_diff(&mut shards, &tracker, "ws-event", diff);
+            }
+            _ = stats_every.tick() => {
+                info!(markets = tracker.len(), symbols = shards.len(), "tracked");
+                log_stats(&shards);
+            }
         }
     }
+    let _ = poller.await;
 
     log_stats(&shards);
     shards.join().await;
@@ -132,15 +160,22 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn log_discovery(event: &exchange::Event) {
-    // M4 acts on these; for now they are only logged.
-    match event {
-        Event::MarketAdded { market, symbols } => {
-            info!(%market, symbols = symbols.len(), "new market announced")
-        }
-        Event::MarketResolved { market, .. } => info!(%market, "market resolved"),
-        _ => {}
+fn apply_diff(shards: &mut ShardManager, tracker: &Tracker, source: &str, diff: Diff) {
+    if diff.is_empty() {
+        return;
     }
+    let removed = shards.remove(diff.remove);
+    let added = shards.add(diff.add);
+    info!(
+        source,
+        markets_added = diff.markets_added,
+        markets_removed = diff.markets_removed,
+        symbols_added = added,
+        symbols_removed = removed,
+        markets = tracker.len(),
+        connections = shards.connections().len(),
+        "subscriptions changed"
+    );
 }
 
 fn log_stats(shards: &ShardManager) {
@@ -159,6 +194,9 @@ fn log_stats(shards: &ShardManager) {
             decode_errors = s.decode_errors.load(Relaxed),
             resyncs = s.resyncs.load(Relaxed),
             minute_snapshots = s.minute_snapshots.load(Relaxed),
+            mb = s.bytes.load(Relaxed) / 1_000_000,
+            busy_ms = s.busy_us.load(Relaxed) / 1000,
+            max_frame_us = s.max_frame_us.load(Relaxed),
             "connection stats"
         );
     }

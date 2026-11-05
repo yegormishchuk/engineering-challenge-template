@@ -32,6 +32,7 @@ fn fast_cfg(url: String) -> ConnectionConfig {
         backoff_max: Duration::from_millis(100),
         stable_after: Duration::from_secs(60),
         subscribe_batch: 500,
+        subscribe_pace: Duration::from_millis(5),
     }
 }
 
@@ -339,6 +340,50 @@ async fn subscriptions_are_batched() {
         assert!(log[0].contains("\"type\":\"market\""));
         assert!(log[1].contains("\"operation\":\"subscribe\""));
         assert!(log[2].contains("[\"E\"]"));
+    }
+    h.finish().await;
+}
+
+#[tokio::test]
+async fn subscriptions_are_paced_not_sent_in_one_burst() {
+    let (url, log) = mock_server(|_, ws, log| idle(ws, log)).await;
+    let mut cfg = fast_cfg(url);
+    cfg.subscribe_batch = 2;
+    cfg.subscribe_pace = Duration::from_millis(150);
+    let started = std::time::Instant::now();
+    let h = start(cfg, &["A", "B", "C", "D", "E"]);
+    eventually("first batch", || log.lock().unwrap().len() == 1).await;
+    assert!(started.elapsed() < Duration::from_millis(150), "first batch goes out at once");
+    eventually("all batches", || log.lock().unwrap().len() == 3).await;
+    assert!(
+        started.elapsed() >= Duration::from_millis(300),
+        "three batches need two pauses: {:?}",
+        started.elapsed()
+    );
+    h.finish().await;
+}
+
+#[tokio::test]
+async fn removing_a_pending_symbol_cancels_its_subscription() {
+    let (url, log) = mock_server(|_, ws, log| idle(ws, log)).await;
+    let mut cfg = fast_cfg(url);
+    cfg.subscribe_batch = 1;
+    cfg.subscribe_pace = Duration::from_millis(200);
+    let h = start(cfg, &["A", "B", "C"]);
+    eventually("first batch", || log.lock().unwrap().len() == 1).await;
+    h.cmds.send(Command::Remove(vec!["C".into()])).unwrap();
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    {
+        let log = log.lock().unwrap();
+        let subscribed: Vec<String> = log
+            .iter()
+            .filter(|m| !m.contains("unsubscribe"))
+            .flat_map(|m| {
+                let v: serde_json::Value = serde_json::from_str(m).unwrap();
+                v["assets_ids"].as_array().unwrap().iter().map(|s| s.as_str().unwrap().to_owned()).collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(subscribed, ["A", "B"], "{log:?}");
     }
     h.finish().await;
 }
