@@ -126,6 +126,14 @@ def main():
         per_m = totals["mismatched_books"] / levels * 1e6
         print(f"  {'mismatched_books / 1M levels':28} {per_m:10.2f}")
     print(f"  {'mismatched + gap_mismatched':28} {totals['mismatched_books'] + totals['gap_mismatched_books']:10,}")
+    # Read-to-processing delay (reader task queue); absent in older logs.
+    delays = sorted(num(f["max_queue_us"]) for f in conn_last.values() if num(f.get("max_queue_us", "")) is not None)
+    if delays:
+        p50 = delays[len(delays) // 2]
+        p99 = delays[min(len(delays) - 1, int(len(delays) * 0.99))]
+        print(f"  max_queue_us over {len(delays)} connections: p50 {p50:,}  p99 {p99:,}  max {delays[-1]:,}")
+        if totals["frames"]:
+            print(f"  mean queue delay per frame: {totals['queue_ms'] * 1000 / totals['frames']:.1f} us")
     # A recycle reconnects without counting a disconnect.
     down = [c for c, f in conn_last.items()
             if int(f["connects"]) - int(f["disconnects"]) - int(f.get("recycles", 0)) != 1]

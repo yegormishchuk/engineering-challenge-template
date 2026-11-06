@@ -129,7 +129,7 @@ written by `AlignedSbeWriter` in 64 MiB chunks, read with
 
   | Field | Value |
   | --- | --- |
-  | `PriceLevelUpdate.backtest_timestamp` | local receive time of the frame, taken before parsing |
+  | `PriceLevelUpdate.backtest_timestamp` | local receive time of the frame, taken when the reader task reads it from the socket (before parsing or queueing) |
   | `PriceLevelUpdate.exchange_timestamp` | `price_change.timestamp` |
   | `Snapshot.received_at` | receive time (exchange book) or emit time (minute snapshot) |
   | `Snapshot.exchange_timestamp` | `book.timestamp`; for a minute snapshot, the last exchange time seen for the token |
@@ -209,6 +209,8 @@ Counters are totals since start.
 | `verify_errors` | failed REST check requests (retried with backoff) |
 | `ignored` | messages not recorded (`last_trade_price`, `best_bid_ask`, …) |
 | `busy_ms`, `max_frame_us` | time spent handling frames, total and longest single frame |
+| `queue_ms`, `max_queue_us` | delay between a frame being read by the reader task (its receive time) and the connection starting to process it: total in ms, longest single delay in µs |
+| `max_queued_frames` | largest number of frames read but not yet processed. A `frame backlog growing` warning is logged at 1024, 2048, 4096, … |
 | `switch_snapshots`, `switch_without_baseline` | snapshots this connection wrote on becoming its shard's source; symbols it had no live book for then (nothing is written for them until their next book) |
 | `lock_wait_ms`, `max_lock_wait_us` | time waiting for the shard's output lock, total and longest |
 | `silent_resyncs` | active tokens resubscribed because they went quiet (see Subscription monitoring) |
@@ -245,7 +247,10 @@ nothing.
 **Sharding.** Each token is assigned to the least-loaded connection with
 room (≤ `--max-per-connection`); a new connection opens when all are full.
 A connection owns its tokens' books and is the only producer of their
-messages, so books need no locks. One writer thread owns the
+messages, so books need no locks. Each socket has a second, small reader task
+that does nothing but read frames, stamp them and queue them (unbounded) for
+the connection task, so a slow writer or a long handler cannot delay receive
+times. One writer thread owns the
 `AlignedSbeWriter` and drains a bounded queue; a full queue suspends only the
 sending connection, never drops.
 
@@ -273,14 +278,24 @@ the token is resynced.
 replacing it (`mismatched_books`). After a reconnect or resync the old book
 is kept as *stale*: not used as a baseline or in minute snapshots, but
 compared with the next book (`gap_mismatched_books`). Receive timestamps are
-taken before parsing, and no decision depends on how fast frames are read.
+taken by the reader task, before parsing, and no decision depends on how fast
+frames are processed.
 
 **Memory.** The collector uses jemalloc: glibc malloc fragmented badly
 across tokio's threads (about 7 KB per token against ~2 KB of live data).
 
-**Time stamps.** Each connection's output times never go backwards: the
-WSL2 clock stepped back 386 ms in one run, so a stamp is never earlier than
-the connection's previous one.
+**Time stamps.** The receive time of a frame is taken when the reader task
+reads it from the socket, not when the connection processes it; the delay
+between the two is `queue_ms` / `max_queue_us`. Each connection's output
+times never go backwards: the WSL2 clock stepped back 386 ms in one run, so
+a stamp is never earlier than the connection's previous one (the reader
+stamps from one clock shared with the connection). A minute snapshot stamped
+T reflects every frame read before T and none read after: before writing
+it, the connection first processes the queued frames read before T. The
+same holds for the other outputs written on a timer (empty guesses,
+shard checks, shutdown, recycle). Frames read before a drop or shutdown are
+still processed and written. The `PONG` timeout counts from the oldest
+unanswered `PING`: a connection is lost when it was sent more than 30 s ago.
 
 ## Redundancy
 
