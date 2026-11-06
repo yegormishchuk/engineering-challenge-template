@@ -101,6 +101,7 @@ validates. `scripts/summarize.py ~/runs/<name>.log` summarizes the log.
 | `--no-verify-empty` | off | Skip REST checks of books assumed empty |
 | `--verify-rate <r>` | 10 | REST checks per second, over all connections |
 | `--redundancy <r>` | 2 | Connections per shard, all subscribed to the same tokens; one writes (1–4; 1 = no redundancy; each member about doubles memory) |
+| `--recycle-hours <h>` | 6 | Reconnect every socket once per this many hours, one at a time (0 = never; see Subscription monitoring) |
 | `--stats-every <secs>` | 30 | Seconds between counter logs |
 
 ## Output format
@@ -208,6 +209,9 @@ Counters are totals since start.
 | `busy_ms`, `max_frame_us` | time spent handling frames, total and longest single frame |
 | `switch_snapshots`, `switch_without_baseline` | snapshots this connection wrote on becoming its shard's source; symbols it had no live book for then (nothing is written for them until their next book) |
 | `lock_wait_ms`, `max_lock_wait_us` | time waiting for the shard's output lock, total and longest |
+| `silent_resyncs` | active tokens resubscribed because they went quiet (see Subscription monitoring) |
+| `active_symbols` | tokens counted as active at the last silence check (gauge) |
+| `recycles`, `recycles_skipped` | planned reconnects done (not counted in `disconnects`); ones skipped because the source had no peer with its books ready |
 
 With `--redundancy` above 1, a `shard source` line per shard follows:
 `source` (connection id writing now), `source_switches`, `lost_on_source` /
@@ -316,6 +320,32 @@ two collector instances on separate hosts (or at least separate machines'
 network paths), each writing its own file; if one crashes, the other's file
 is complete. Choosing between them afterwards is a matter of `validate` and
 the counters.
+
+## Subscription monitoring
+
+An exchange can stop sending a subscription without saying so, or slow down
+a socket it has been serving for hours. Two mechanisms handle that, at every
+`--redundancy`:
+
+- **Quiet tokens.** Each connection tracks, per token, a moving average of
+  the time between frames that change its book (several entries of one
+  frame count once). A token is *active* after 10 such frames with an
+  average gap under 60 s. Every 5 s, an active token that has had nothing
+  for max(5 × its average gap, 60 s) is resubscribed (unsubscribe, fresh
+  book, compared with the old one), at most 100 per connection per check.
+  A market that really stopped trading drops out by itself: each resync's
+  book adds the long gap to the average, and after a few rounds the token
+  is no longer active. With redundancy, the hash check (Redundancy) usually
+  catches a token silent on one socket first; this check also covers a
+  token silent on every socket.
+- **Recycling.** Every connection is reconnected once per
+  `--recycle-hours` (default 6), one at a time, spread evenly over the
+  period. The next one waits until the previous one is back with books for
+  99% of its tokens (or 10 minutes have passed). A source first hands over
+  to a peer that has books for 99% of the tokens; if there is none, the
+  recycle is skipped until the next round. With `--redundancy 1` there is
+  no peer: a recycle is a short gap, recorded like any reconnect (stale
+  books, `gap_mismatched_books`).
 
 ## Measured limits
 
