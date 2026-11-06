@@ -54,11 +54,41 @@ use crate::writer::{OutSender, WriterGone};
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
+/// Spaces requests evenly, shared by every connection: at full scale ~100
+/// connections each start REST checks at about the same time.
+#[derive(Debug)]
+pub struct RateLimiter {
+    interval: Duration,
+    next: std::sync::Mutex<Instant>,
+}
+
+impl RateLimiter {
+    pub fn per_second(n: f64) -> Arc<Self> {
+        Arc::new(Self {
+            interval: Duration::from_secs_f64(1.0 / n.max(0.001)),
+            next: std::sync::Mutex::new(Instant::now()),
+        })
+    }
+
+    /// Waits for this caller's slot.
+    pub async fn acquire(&self) {
+        let at = {
+            let mut next = self.next.lock().expect("limiter lock");
+            let at = (*next).max(Instant::now());
+            *next = at + self.interval;
+            at
+        };
+        tokio::time::sleep_until(at).await;
+    }
+}
+
 /// Checks of assumed-empty books against REST. `None` in
 /// [`ConnectionConfig::verify`] disables them (tests, or no network).
 #[derive(Debug, Clone)]
 pub struct VerifyConfig {
     pub http: reqwest::Client,
+    /// Shared by all connections; see [`RateLimiter`].
+    pub limiter: Arc<RateLimiter>,
     pub url: String,
     /// Symbols per request.
     pub batch: usize,
@@ -77,9 +107,10 @@ pub struct VerifyConfig {
 }
 
 impl VerifyConfig {
-    pub fn polymarket(http: reqwest::Client) -> Self {
+    pub fn polymarket(http: reqwest::Client, requests_per_second: f64) -> Self {
         Self {
             http,
+            limiter: RateLimiter::per_second(requests_per_second),
             url: polymarket::BOOKS_URL.to_owned(),
             batch: 200,
             every: Duration::from_secs(2),
@@ -252,6 +283,15 @@ pub struct Connection {
     assumed: HashSet<String>,
     /// Assumed-empty symbols waiting for a REST check.
     to_verify: Vec<String>,
+    /// REST results waiting for the stream to be read past the moment they
+    /// arrived: each with the send time of the `PING` sent then. Judged only
+    /// once that `PING` is answered, so a lagging reader cannot make a
+    /// correct guess look wrong.
+    verify_waiting: VecDeque<(Instant, Verified)>,
+    /// Symbols unsubscribed on this socket, with the barrier `PING` sent
+    /// after the unsubscribe. If one is added back before that `PING` is
+    /// answered, data from the old subscription is dropped like in a resync.
+    recently_removed: HashMap<String, Instant>,
     /// REST levels missing from the local book, per symbol, since when. A
     /// guess is wrong only if some of the same levels are still missing
     /// `confirm_after` later.
@@ -306,6 +346,8 @@ impl Connection {
             assumed: HashSet::new(),
             to_verify: Vec::new(),
             suspect: HashMap::new(),
+            verify_waiting: VecDeque::new(),
+            recently_removed: HashMap::new(),
             wrong_guesses: HashMap::new(),
             gave_up: HashSet::new(),
             verify_not_before: Instant::now(),
@@ -439,6 +481,8 @@ impl Connection {
         self.resyncing.clear();
         self.assumed.clear();
         self.suspect.clear();
+        self.verify_waiting.clear();
+        self.recently_removed.clear();
         let empty_every = self
             .cfg
             .empty_book_after
@@ -507,11 +551,11 @@ impl Connection {
                 }
                 Some(verified) = verified_rx.recv() => {
                     verify_in_flight = false;
-                    match self.on_verified(&mut ws, verified).await {
-                        Ok(()) => {}
-                        Err(Stop::Lost(reason)) => return Ok(SessionEnd::Lost(reason)),
-                        Err(Stop::WriterGone) => return Err(WriterGone),
+                    if let Err(reason) = self.send_ping(&mut ws).await {
+                        return Ok(SessionEnd::Lost(reason));
                     }
+                    let barrier = *self.pings.back().expect("just sent");
+                    self.verify_waiting.push_back((barrier, verified));
                 }
                 _ = ping.tick() => {
                     if last_pong.elapsed() > self.cfg.pong_timeout {
@@ -532,6 +576,9 @@ impl Connection {
                         Some(Command::Add(symbols)) => {
                             for s in symbols {
                                 if self.symbols.insert(s.clone()) {
+                                    if let Some(&barrier) = self.recently_removed.get(&s) {
+                                        self.resyncing.insert(s.clone(), barrier);
+                                    }
                                     self.pending.push_back(s);
                                 }
                             }
@@ -545,7 +592,7 @@ impl Connection {
                             let gone_set: HashSet<&String> = gone.iter().collect();
                             self.pending.retain(|p| !gone_set.contains(p));
                             self.to_verify.retain(|p| !gone_set.contains(p));
-                            self.send_unsubscribe(&mut ws, &gone).await
+                            self.unsubscribe_removed(&mut ws, &gone).await
                         }
                     };
                     if let Err(reason) = result {
@@ -641,6 +688,7 @@ impl Connection {
                 self.assumed.remove(&symbol);
                 self.suspect.remove(&symbol);
                 self.wrong_guesses.remove(&symbol);
+                self.gave_up.remove(&symbol);
                 match self.books.apply_snapshot(&symbol, bids, asks, exchange_ts, received_at) {
                     Ok(applied) => {
                         inc(&self.stats.books);
@@ -699,8 +747,14 @@ impl Connection {
                 *last_pong = Instant::now();
                 if let Some(sent) = self.pings.pop_front() {
                     self.acked_through = Some(sent);
-                    // Resyncs whose old data has now all been read.
+                    // Resyncs and removals whose old data has now all been read.
                     self.resyncing.retain(|_, barrier| *barrier > sent);
+                    self.recently_removed.retain(|_, barrier| *barrier > sent);
+                    // REST results the stream has now caught up with.
+                    while self.verify_waiting.front().is_some_and(|(barrier, _)| *barrier <= sent) {
+                        let (_, verified) = self.verify_waiting.pop_front().expect("checked");
+                        Box::pin(self.on_verified(ws, verified)).await?;
+                    }
                     // The barrier just moved: books still missing now are
                     // not coming.
                     self.assume_empty_books().await?;
@@ -854,6 +908,7 @@ impl Connection {
         let n = self.to_verify.len().min(verify.batch);
         let checked: Vec<String> = self.to_verify.drain(..n).collect();
         tokio::spawn(async move {
+            verify.limiter.acquire().await;
             let request = verify
                 .http
                 .post(&verify.url)
@@ -961,6 +1016,21 @@ impl Connection {
                 "REST shows resting orders missing from books assumed empty; resyncing them"
             );
             self.resync(ws, &wrong).await?;
+        }
+        Ok(())
+    }
+
+    /// Unsubscribes removed symbols and sends a barrier `PING`, remembered
+    /// in case a symbol is added back before old data is drained.
+    async fn unsubscribe_removed(&mut self, ws: &mut Ws, gone: &[String]) -> Result<(), String> {
+        if gone.is_empty() || !self.initial_sent {
+            return Ok(());
+        }
+        self.send_unsubscribe(ws, gone).await?;
+        self.send_ping(ws).await?;
+        let barrier = *self.pings.back().expect("just sent");
+        for s in gone {
+            self.recently_removed.insert(s.clone(), barrier);
         }
         Ok(())
     }

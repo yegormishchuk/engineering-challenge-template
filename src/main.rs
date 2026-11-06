@@ -27,8 +27,9 @@ struct Args {
     #[arg(long, default_value = "-")]
     output: String,
 
-    /// Most symbols (outcome tokens) per websocket connection.
-    #[arg(long, default_value_t = 500)]
+    /// Most symbols (outcome tokens) per websocket connection. 5000 ran
+    /// without errors live; all ~514k tokens then need about 100 sockets.
+    #[arg(long, default_value_t = 5000)]
     max_per_connection: usize,
 
     /// Record at most this many markets (for testing). Default: all.
@@ -55,6 +56,10 @@ struct Args {
     /// Do not check books assumed empty against the REST batch endpoint.
     #[arg(long)]
     no_verify_empty: bool,
+
+    /// Most REST checks of empty books per second, over all connections.
+    #[arg(long, default_value_t = 10.0)]
+    verify_rate: f64,
 
     /// Seconds between counter logs.
     #[arg(long, default_value_t = 30)]
@@ -107,7 +112,7 @@ async fn main() -> anyhow::Result<()> {
     let (discovery_tx, mut discovery_rx) = mpsc::unbounded_channel::<Event>();
     let mut shards = ShardManager::new(
         ConnectionConfig {
-            verify: (!args.no_verify_empty).then(|| VerifyConfig::polymarket(http.clone())),
+            verify: (!args.no_verify_empty).then(|| VerifyConfig::polymarket(http.clone(), args.verify_rate)),
             ..ConnectionConfig::default()
         },
         args.max_per_connection,

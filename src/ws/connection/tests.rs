@@ -95,13 +95,31 @@ async fn answer_for(ws: &mut ServerWs, log: &Mutex<Vec<String>>, dur: Duration) 
     .await;
 }
 
-/// Reads for `dur` without answering PINGs, like a server that is still
-/// sending earlier data.
-async fn ignore_pings_for(ws: &mut ServerWs, log: &Mutex<Vec<String>>, dur: Duration) {
+/// Reads for `dur` without answering PINGs yet, like a server that is still
+/// sending earlier data. Returns how many PINGs are owed; answer them with
+/// [`pong_owed`].
+async fn ignore_pings_for(ws: &mut ServerWs, log: &Mutex<Vec<String>>, dur: Duration) -> usize {
+    let mut owed = 0;
     let _ = tokio::time::timeout(dur, async {
-        while next_text(ws, log, false).await.is_some() {}
+        while let Some(Ok(msg)) = ws.next().await {
+            if let Message::Text(t) = msg {
+                if t.as_str() == "PING" {
+                    owed += 1;
+                } else {
+                    log.lock().unwrap().push(t.to_string());
+                }
+            }
+        }
     })
     .await;
+    owed
+}
+
+/// Answers PINGs that were held back, in order.
+async fn pong_owed(ws: &mut ServerWs, owed: usize) {
+    for _ in 0..owed {
+        ws.send(Message::text("PONG")).await.unwrap();
+    }
 }
 
 /// A change for B with the given exchange timestamp.
@@ -613,6 +631,7 @@ async fn mock_books_http_with(books: &'static [(&'static str, &'static str)]) ->
 fn verify_cfg(url: String) -> Option<VerifyConfig> {
     Some(VerifyConfig {
         http: reqwest::Client::new(),
+        limiter: RateLimiter::per_second(1000.0),
         url,
         batch: 200,
         every: Duration::from_millis(50),
@@ -729,10 +748,11 @@ async fn first_book_after_a_reconnect_is_compared_with_the_old_book() {
 async fn a_lagging_reader_does_not_guess_empty_while_books_may_be_unread() {
     let (url, _log) = mock_server(|_, mut ws, log| async move {
         next_text(&mut ws, &log, true).await;
-        // The server is slow: PINGs go unanswered for a while, well past the
-        // grace period, and then the book arrives.
-        ignore_pings_for(&mut ws, &log, Duration::from_millis(900)).await;
+        // The server is behind: PINGs go unanswered for a while, well past
+        // the grace period; then the book arrives, then the owed PONGs.
+        let owed = ignore_pings_for(&mut ws, &log, Duration::from_millis(900)).await;
         send(&mut ws, &BOOK_A.replace("\"A\"", "\"B\"")).await;
+        pong_owed(&mut ws, owed).await;
         idle(ws, log).await;
     })
     .await;
@@ -834,12 +854,13 @@ async fn a_stale_book_read_after_the_resubscribe_is_still_dropped() {
             send(&mut ws, &bad).await; // the client resyncs A
             // The client unsubscribes, sends its barrier PING and soon the new
             // subscribe; this server is behind and answers nothing yet.
-            ignore_pings_for(&mut ws, &log, Duration::from_millis(300)).await;
+            let owed = ignore_pings_for(&mut ws, &log, Duration::from_millis(300)).await;
             // Still from before the unsubscribe, read after the resubscribe.
             send(&mut ws, BOOK_A).await;
             send(&mut ws, CHANGE_A).await;
-            // Now the barrier PING is answered, then the fresh book follows.
-            answer_for(&mut ws, &log, Duration::from_millis(100)).await;
+            // Now every PING sent so far is answered, in order, and the
+            // fresh book follows.
+            pong_owed(&mut ws, owed).await;
             send(&mut ws, &BOOK_A.replace("\"10\"", "\"12\"")).await;
             idle(ws, log).await;
         }
@@ -851,4 +872,69 @@ async fn a_stale_book_read_after_the_resubscribe_is_still_dropped() {
     assert_eq!(h.get(|s| &s.mismatched_books), 0);
     assert_eq!(h.get(|s| &s.levels), 0);
     h.finish().await;
+}
+
+#[tokio::test]
+async fn a_rest_result_waits_until_the_stream_catches_up() {
+    // REST shows an order that the lagging stream delivers only later; the
+    // check must not call the correct empty guess wrong in the meantime.
+    let (ws_url, _log) = mock_server(|_, mut ws, log| async move {
+        next_text(&mut ws, &log, true).await;
+        answer_for(&mut ws, &log, Duration::from_millis(200)).await; // guess happens
+        // Behind: hold PINGs, including the one sent when the REST answer came.
+        let owed = ignore_pings_for(&mut ws, &log, Duration::from_millis(600)).await;
+        send(&mut ws, &change_b_at(Utc::now().timestamp_millis())).await;
+        pong_owed(&mut ws, owed).await;
+        idle(ws, log).await;
+    })
+    .await;
+    let (http_url, _requests) = mock_books_http_with(&[("B", r#"{"asset_id":"B","bids":[],"asks":[{"price":"0.10","size":"1"}]}"#)]).await;
+    let mut cfg = fast_cfg(ws_url);
+    cfg.empty_book_after = Duration::from_millis(50);
+    cfg.verify = verify_cfg(http_url).map(|mut v| {
+        v.confirm_after = Duration::from_millis(100); // shorter than the lag
+        v
+    });
+    let h = start(cfg, &["B"]);
+    eventually("change applied", || h.get(|s| &s.levels) == 1).await;
+    eventually("confirmed", || h.get(|s| &s.empty_confirmed) >= 1).await;
+    assert_eq!(h.get(|s| &s.empty_wrong), 0);
+    assert_eq!(h.get(|s| &s.resyncs), 0);
+    h.finish().await;
+}
+
+#[tokio::test]
+async fn a_symbol_added_back_right_after_removal_ignores_old_data() {
+    let (url, log) = mock_server(|_, mut ws, log| async move {
+        next_text(&mut ws, &log, true).await; // subscribe A
+        send(&mut ws, BOOK_A).await;
+        // Unsubscribe, barrier PING and re-subscribe arrive while this
+        // server is behind.
+        let owed = ignore_pings_for(&mut ws, &log, Duration::from_millis(400)).await;
+        send(&mut ws, BOOK_A).await; // from the old subscription
+        pong_owed(&mut ws, owed).await;
+        send(&mut ws, &BOOK_A.replace("\"10\"", "\"12\"")).await;
+        idle(ws, log).await;
+    })
+    .await;
+    let h = start(fast_cfg(url), &["A"]);
+    eventually("first book", || h.get(|s| &s.books) == 1).await;
+    h.cmds.send(Command::Remove(vec!["A".into()])).unwrap();
+    h.cmds.send(Command::Add(vec!["A".into()])).unwrap();
+    eventually("fresh book", || h.get(|s| &s.books) == 2).await;
+    assert_eq!(h.get(|s| &s.dropped_during_resync), 1);
+    assert_eq!(h.get(|s| &s.mismatched_books), 0);
+    assert!(log.lock().unwrap().iter().any(|m| m.contains("unsubscribe")));
+    h.finish().await;
+}
+
+#[tokio::test]
+async fn rate_limiter_spaces_requests() {
+    let limiter = RateLimiter::per_second(20.0);
+    let started = std::time::Instant::now();
+    for _ in 0..5 {
+        limiter.acquire().await;
+    }
+    // Five slots at 50 ms intervals: the last starts 200 ms after the first.
+    assert!(started.elapsed() >= Duration::from_millis(190), "{:?}", started.elapsed());
 }
