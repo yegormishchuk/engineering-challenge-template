@@ -586,8 +586,8 @@ mod tests {
     }
 
     /// A raw HTTP server that answers request `n` (from 0) with
-    /// `respond(n)` = (status line, body). Returns its base URL.
-    async fn http_server(respond: fn(usize) -> (&'static str, &'static str)) -> String {
+    /// `respond(n, request head)` = (status line, body). Returns its base URL.
+    async fn http_server(respond: fn(usize, &str) -> (&'static str, &'static str)) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -595,8 +595,9 @@ mod tests {
             let mut n = 0;
             while let Ok((mut stream, _)) = listener.accept().await {
                 let mut buf = vec![0; 8192];
-                let _ = stream.read(&mut buf).await;
-                let (status, body) = respond(n);
+                let len = stream.read(&mut buf).await.unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..len]).to_ascii_lowercase();
+                let (status, body) = respond(n, &head);
                 n += 1;
                 let reply = format!(
                     "HTTP/1.1 {status}
@@ -617,7 +618,7 @@ Connection: close
 
     #[tokio::test]
     async fn a_page_that_fails_once_is_retried_not_the_whole_pass() {
-        let url = http_server(|n| if n == 0 { ("500 Internal Server Error", "busy") } else { ("200 OK", ONE_EVENT_PAGE) }).await;
+        let url = http_server(|n, _| if n == 0 { ("500 Internal Server Error", "busy") } else { ("200 OK", ONE_EVENT_PAGE) }).await;
         let (tx, mut rx) = mpsc::channel(8);
         let markets = fetch_full(&reqwest::Client::new(), &url, None, &tx).await.unwrap();
         assert_eq!(markets.len(), 1);
@@ -625,8 +626,26 @@ Connection: close
     }
 
     #[tokio::test]
+    async fn full_pass_pages_are_requested_compressed() {
+        // A page is ~37 MB of JSON, ~3.8 MB gzipped; uncompressed pages did
+        // not download within the timeout while the websockets filled a
+        // ~40 Mbit/s link (T1, 2026-11-06).
+        let url = http_server(|_, head| {
+            if head.lines().any(|l| l.starts_with("accept-encoding:") && l.contains("gzip")) {
+                ("200 OK", ONE_EVENT_PAGE)
+            } else {
+                ("406 Not Acceptable", "gzip only")
+            }
+        })
+        .await;
+        let (tx, _rx) = mpsc::channel(8);
+        let markets = fetch_full(&reqwest::Client::new(), &url, None, &tx).await.unwrap();
+        assert_eq!(markets.len(), 1);
+    }
+
+    #[tokio::test]
     async fn a_page_that_keeps_failing_fails_the_pass() {
-        let url = http_server(|_| ("500 Internal Server Error", "down")).await;
+        let url = http_server(|_, _| ("500 Internal Server Error", "down")).await;
         let (tx, _rx) = mpsc::channel(8);
         assert!(fetch_full(&reqwest::Client::new(), &url, None, &tx).await.is_err());
     }
