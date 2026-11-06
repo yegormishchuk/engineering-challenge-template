@@ -18,6 +18,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::ops::RangeInclusive;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::Duration;
 
 use anyhow::{Context, bail};
@@ -80,6 +81,15 @@ fn parse_refresh(s: &str) -> Result<(usize, Duration), String> {
     let k: usize = k.parse().map_err(|e| format!("bad k: {e}"))?;
     let secs: u64 = secs.parse().map_err(|e| format!("bad secs: {e}"))?;
     Ok((k, Duration::from_secs(secs)))
+}
+
+/// Per-socket counters, summed over its sessions; printed at exit.
+#[derive(Default)]
+struct SocketStats {
+    frames: AtomicU64,
+    decode_errors: AtomicU64,
+    rows: AtomicU64,
+    sessions: AtomicU64,
 }
 
 /// What the rows of one websocket session have in common.
@@ -152,6 +162,7 @@ async fn session(
     n: u32,
     subscribe: &str,
     tx: &mpsc::UnboundedSender<String>,
+    stats: &SocketStats,
     cancel: &CancellationToken,
 ) -> anyhow::Result<()> {
     let tcp = TcpSocket::new_v4()?;
@@ -191,9 +202,16 @@ async fn session(
         let recv_us = Utc::now().timestamp_micros();
         match frame.context("stream closed")?? {
             Message::Text(text) => {
-                if let Ok(decoded) = decode(&text) {
-                    for row in decoded.events.iter().filter_map(|e| csv_row(&conn, recv_us, e)) {
-                        let _ = tx.send(row);
+                stats.frames.fetch_add(1, Relaxed);
+                match decode(&text) {
+                    Ok(decoded) => {
+                        for row in decoded.events.iter().filter_map(|e| csv_row(&conn, recv_us, e)) {
+                            let _ = tx.send(row);
+                            stats.rows.fetch_add(1, Relaxed);
+                        }
+                    }
+                    Err(_) => {
+                        stats.decode_errors.fetch_add(1, Relaxed);
                     }
                 }
             }
@@ -243,6 +261,7 @@ async fn main() -> anyhow::Result<()> {
     writeln!(out, "{HEADER}")?;
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
     let cancel = CancellationToken::new();
+    let stats: Arc<Vec<SocketStats>> = Arc::new((0..args.sockets).map(|_| SocketStats::default()).collect());
     let mut tasks = Vec::new();
     for socket in 0..args.sockets {
         let plan = Plan {
@@ -251,11 +270,12 @@ async fn main() -> anyhow::Result<()> {
             port: args.ports.as_ref().and_then(|p| p.clone().nth(socket)),
             refresh: args.refresh.filter(|(k, _)| socket < *k).map(|(_, d)| d),
         };
-        let (tx, cancel, subscribe) = (tx.clone(), cancel.clone(), subscribe.clone());
+        let (tx, cancel, subscribe, stats) = (tx.clone(), cancel.clone(), subscribe.clone(), stats.clone());
         tasks.push(tokio::spawn(async move {
             let mut n = 0;
             while !cancel.is_cancelled() {
-                if let Err(e) = session(&plan, n, &subscribe, &tx, &cancel).await {
+                stats[plan.socket].sessions.fetch_add(1, Relaxed);
+                if let Err(e) = session(&plan, n, &subscribe, &tx, &stats[plan.socket], &cancel).await {
                     eprintln!("socket {} session {n}: {e:#}", plan.socket);
                     tokio::select! {
                         _ = tokio::time::sleep(Duration::from_secs(1)) => {}
@@ -288,6 +308,15 @@ async fn main() -> anyhow::Result<()> {
         rows += 1;
     }
     out.flush()?;
+    for (i, s) in stats.iter().enumerate() {
+        eprintln!(
+            "socket={i} frames={} decode_errors={} rows={} sessions={}",
+            s.frames.load(Relaxed),
+            s.decode_errors.load(Relaxed),
+            s.rows.load(Relaxed),
+            s.sessions.load(Relaxed)
+        );
+    }
     eprintln!("{rows} rows written to {}", args.out.display());
     Ok(())
 }
