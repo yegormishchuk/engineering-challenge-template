@@ -12,6 +12,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 
 use super::*;
+use crate::ws::source::ShardSource;
 use crate::util::dtos::challenge_orderbook::{AnyMessage, PriceLevelUpdateDomain, SnapshotDomain};
 use crate::util::{AlignedSbeReader, OrderbookSchema};
 use crate::writer::{self, OutMsg, Output};
@@ -969,4 +970,199 @@ async fn rate_limiter_spaces_requests() {
     }
     // Five slots at 50 ms intervals: the last starts 200 ms after the first.
     assert!(started.elapsed() >= Duration::from_millis(190), "{:?}", started.elapsed());
+}
+
+// ---- Redundant connections (Extension 1) ----
+
+/// Two (or more) connections of one shard, one mock server each, sharing a
+/// writer and a `ShardSource`.
+struct ShardHarness {
+    cmds: Vec<mpsc::UnboundedSender<Command>>,
+    ticks: watch::Sender<chrono::DateTime<Utc>>,
+    shutdown: CancellationToken,
+    stats: Vec<Arc<ConnStats>>,
+    shard: Arc<ShardSource>,
+    tasks: Vec<tokio::task::JoinHandle<Result<(), WriterGone>>>,
+    writer: writer::WriterHandle,
+    path: std::path::PathBuf,
+    _dir: tempfile::TempDir,
+}
+
+fn start_shard(cfgs: Vec<ConnectionConfig>, symbols: &[&str]) -> ShardHarness {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("out.sbe");
+    let (out, writer) = writer::spawn(&Output::File(path.clone()), 1024).unwrap();
+    let (ticks, tick_rx) = watch::channel(Utc::now());
+    let shutdown = CancellationToken::new();
+    let shard = Arc::new(ShardSource::new(0, cfgs.len()));
+    let (mut cmds, mut stats, mut tasks) = (Vec::new(), Vec::new(), Vec::new());
+    for (index, cfg) in cfgs.into_iter().enumerate() {
+        let s = Arc::new(ConnStats::default());
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(Command::Add(symbols.iter().map(|s| s.to_string()).collect()))
+            .unwrap();
+        let conn = Connection::new(index, cfg, out.clone(), Arc::clone(&s), None).with_member(Member {
+            index,
+            shard: Arc::clone(&shard),
+        });
+        tasks.push(tokio::spawn(conn.run(rx, tick_rx.clone(), shutdown.clone())));
+        cmds.push(tx);
+        stats.push(s);
+    }
+    ShardHarness {
+        cmds,
+        ticks,
+        shutdown,
+        stats,
+        shard,
+        tasks,
+        writer,
+        path,
+        _dir: dir,
+    }
+}
+
+impl ShardHarness {
+    fn get(&self, member: usize, f: impl Fn(&ConnStats) -> &AtomicU64) -> u64 {
+        f(&self.stats[member]).load(Ordering::Relaxed)
+    }
+
+    fn switches(&self) -> u64 {
+        self.shard.switches.load(Ordering::Relaxed)
+    }
+
+    async fn finish(self) -> Vec<OutMsg> {
+        self.shutdown.cancel();
+        for task in self.tasks {
+            tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .expect("connection stops on shutdown")
+                .unwrap()
+                .unwrap();
+        }
+        drop(self.cmds);
+        self.writer.join().unwrap();
+        read_all(&self.path)
+    }
+}
+
+/// Replays `msgs` like `validate` does.
+fn replay(msgs: &[OutMsg]) -> crate::validate::Report {
+    let mut v = crate::validate::Validator::new();
+    for m in msgs {
+        match m {
+            OutMsg::Snapshot(s) => v.snapshot(s),
+            OutMsg::Update(u) => v.update(u),
+        }
+    }
+    v.finish()
+}
+
+/// A change for A setting the 0.40 bid to `size`, at exchange time `ms`.
+fn change_a(size: &str, ms: i64) -> String {
+    CHANGE_A
+        .replace("\"15\"", &format!("\"{size}\""))
+        .replace("1793822781001", &ms.to_string())
+}
+
+#[tokio::test]
+async fn redundant_members_write_every_change_once() {
+    let mut urls = Vec::new();
+    for _ in 0..2 {
+        let (url, _log) = mock_server(|_, mut ws, log| async move {
+            next_text(&mut ws, &log, true).await;
+            send(&mut ws, BOOK_A).await;
+            send(&mut ws, CHANGE_A).await;
+            idle(ws, log).await;
+        })
+        .await;
+        urls.push(url);
+    }
+    let h = start_shard(urls.into_iter().map(fast_cfg).collect(), &["A"]);
+    eventually("both applied the change", || h.get(0, |s| &s.levels) == 1 && h.get(1, |s| &s.levels) == 1)
+        .await;
+    h.ticks.send(Utc::now()).unwrap();
+    eventually("a minute snapshot", || {
+        h.get(0, |s| &s.minute_snapshots) + h.get(1, |s| &s.minute_snapshots) == 1
+    })
+    .await;
+    let msgs = h.finish().await;
+    assert_eq!(kinds(&msgs), ["S:A", "U:A:15000000", "S:A"], "no duplicates from the peer");
+}
+
+#[tokio::test]
+async fn a_dropped_source_hands_over_with_a_snapshot_and_no_gap() {
+    let drop_source = Arc::new(tokio::sync::Notify::new());
+    let peer_start = Arc::new(tokio::sync::Notify::new());
+    let peer_go = Arc::new(tokio::sync::Notify::new());
+    let (url0, _) = mock_server({
+        let drop_source = Arc::clone(&drop_source);
+        move |n, mut ws, log| {
+            let drop_source = Arc::clone(&drop_source);
+            async move {
+                next_text(&mut ws, &log, true).await;
+                if n > 0 {
+                    // After the drop: subscribed again, but nothing comes.
+                    return idle(ws, log).await;
+                }
+                send(&mut ws, BOOK_A).await;
+                send(&mut ws, CHANGE_A).await;
+                let _ = tokio::time::timeout(Duration::from_secs(5), async {
+                    tokio::select! {
+                        _ = drop_source.notified() => {}
+                        _ = answer_for(&mut ws, &log, Duration::from_secs(5)) => {}
+                    }
+                })
+                .await;
+                // Dropping the socket ends the session abruptly.
+            }
+        }
+    })
+    .await;
+    let (url1, _) = mock_server({
+        let (peer_start, peer_go) = (Arc::clone(&peer_start), Arc::clone(&peer_go));
+        move |_, mut ws, log| {
+            let (peer_start, peer_go) = (Arc::clone(&peer_start), Arc::clone(&peer_go));
+            async move {
+                next_text(&mut ws, &log, true).await;
+                // Only once member 0 is up, so it stays the source.
+                tokio::select! {
+                    _ = peer_start.notified() => {}
+                    _ = answer_for(&mut ws, &log, Duration::from_secs(5)) => {}
+                }
+                send(&mut ws, BOOK_A).await;
+                send(&mut ws, CHANGE_A).await;
+                tokio::select! {
+                    _ = peer_go.notified() => {}
+                    _ = answer_for(&mut ws, &log, Duration::from_secs(5)) => {}
+                }
+                send(&mut ws, &change_a("20", 1793822782000)).await;
+                idle(ws, log).await;
+            }
+        }
+    })
+    .await;
+    let h = start_shard(vec![fast_cfg(url0), fast_cfg(url1)], &["A"]);
+    eventually("member 0 connected", || h.get(0, |s| &s.connects) == 1).await;
+    peer_start.notify_one();
+    eventually("both have the change", || h.get(0, |s| &s.levels) == 1 && h.get(1, |s| &s.levels) == 1)
+        .await;
+    assert_eq!((h.shard.lock().await.source, h.switches()), (0, 0));
+    drop_source.notify_one();
+    eventually("peer took over", || h.switches() == 1).await;
+    assert_eq!(h.shard.lock().await.source, 1);
+    peer_go.notify_one();
+    eventually("peer's change", || h.get(1, |s| &s.levels) == 2).await;
+    eventually("written", || h.get(1, |s| &s.switch_snapshots) >= 1).await;
+    let msgs = h.finish().await;
+
+    // The peer's snapshot precedes its first update, and every change is
+    // written once.
+    let k = kinds(&msgs);
+    let peer_update = k.iter().position(|m| m == "U:A:20000000").expect("peer's update written");
+    assert_eq!(k[peer_update - 1], "S:A", "switch snapshot before the peer's update: {k:?}");
+    assert_eq!(k.iter().filter(|m| *m == "U:A:15000000").count(), 1, "{k:?}");
+    let r = replay(&msgs);
+    assert!(r.file_is_consistent(), "{r:?}");
+    assert_eq!((r.updates_without_baseline, r.mismatched), (0, 0), "{r:?}");
 }

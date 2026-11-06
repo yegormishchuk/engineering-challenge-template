@@ -1,7 +1,9 @@
-//! Spreads symbols across connections, at most `max_per_connection` each.
+//! Spreads symbols across shards, at most `max_per_connection` each.
 //!
-//! New symbols go to the least-loaded connection that has room; when every
-//! connection is full a new one is started. Removing symbols frees room but
+//! A shard is `redundancy` connections subscribed to the same symbols (see
+//! [`crate::ws::source`]); with redundancy 1 it is a single connection.
+//! New symbols go to the least-loaded shard that has room; when every
+//! shard is full a new one is started. Removing symbols frees room but
 //! never closes a connection: an empty connection simply disconnects and
 //! waits for work (see [`Connection::run`]).
 
@@ -15,7 +17,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::exchange::Event;
 use crate::writer::{OutSender, WriterGone};
-use crate::ws::connection::{Command, ConnStats, Connection, ConnectionConfig};
+use crate::ws::connection::{Command, ConnStats, Connection, ConnectionConfig, Member};
+use crate::ws::source::ShardSource;
 
 /// Why the collector cannot go on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,15 +36,19 @@ impl std::fmt::Display for Failure {
     }
 }
 
+/// One shard: its member connections and their symbol count.
 struct Slot {
-    tx: mpsc::UnboundedSender<Command>,
+    txs: Vec<mpsc::UnboundedSender<Command>>,
     count: usize,
-    stats: Arc<ConnStats>,
+    stats: Vec<Arc<ConnStats>>,
+    /// `None` with redundancy 1.
+    source: Option<Arc<ShardSource>>,
 }
 
 pub struct ShardManager {
     cfg: ConnectionConfig,
     max_per_connection: usize,
+    redundancy: usize,
     out: OutSender,
     ticks: watch::Receiver<DateTime<Utc>>,
     shutdown: CancellationToken,
@@ -69,6 +76,7 @@ impl ShardManager {
         Self {
             cfg,
             max_per_connection,
+            redundancy: 1,
             out,
             ticks,
             shutdown,
@@ -77,6 +85,14 @@ impl ShardManager {
             assignment: HashMap::new(),
             tasks: JoinSet::new(),
         }
+    }
+
+    /// Connections per shard (default 1). Call before adding symbols.
+    pub fn with_redundancy(mut self, redundancy: usize) -> Self {
+        assert!(redundancy > 0, "redundancy must be positive");
+        assert!(self.slots.is_empty(), "set redundancy before adding symbols");
+        self.redundancy = redundancy;
+        self
     }
 
     pub fn len(&self) -> usize {
@@ -91,9 +107,18 @@ impl ShardManager {
         self.assignment.contains_key(symbol)
     }
 
-    /// Per-connection symbol counts and counters, in connection order.
+    /// Per-connection symbol counts and counters, in connection order
+    /// (shard by shard).
     pub fn connections(&self) -> Vec<(usize, Arc<ConnStats>)> {
-        self.slots.iter().map(|s| (s.count, Arc::clone(&s.stats))).collect()
+        self.slots
+            .iter()
+            .flat_map(|s| s.stats.iter().map(move |st| (s.count, Arc::clone(st))))
+            .collect()
+    }
+
+    /// Per shard with redundancy: its source state.
+    pub fn sources(&self) -> Vec<Arc<ShardSource>> {
+        self.slots.iter().filter_map(|s| s.source.clone()).collect()
     }
 
     /// Assigns and subscribes symbols not already assigned. Returns how many
@@ -112,7 +137,9 @@ impl ShardManager {
         let added = batches.values().map(Vec::len).sum();
         for (slot, batch) in batches {
             // A send fails only if the task has ended, i.e. during shutdown.
-            let _ = self.slots[slot].tx.send(Command::Add(batch));
+            for tx in &self.slots[slot].txs {
+                let _ = tx.send(Command::Add(batch.clone()));
+            }
         }
         added
     }
@@ -128,7 +155,9 @@ impl ShardManager {
         }
         let removed = batches.values().map(Vec::len).sum();
         for (slot, batch) in batches {
-            let _ = self.slots[slot].tx.send(Command::Remove(batch));
+            for tx in &self.slots[slot].txs {
+                let _ = tx.send(Command::Remove(batch.clone()));
+            }
         }
         removed
     }
@@ -174,20 +203,37 @@ impl ShardManager {
     }
 
     fn spawn_connection(&mut self) -> usize {
-        let id = self.slots.len();
-        let (tx, rx) = mpsc::unbounded_channel();
-        let stats = Arc::new(ConnStats::default());
-        let conn = Connection::new(
-            id,
-            self.cfg.clone(),
-            self.out.clone(),
-            Arc::clone(&stats),
-            self.discovery.clone(),
-        );
-        self.tasks
-            .spawn(conn.run(rx, self.ticks.clone(), self.shutdown.clone()));
-        self.slots.push(Slot { tx, count: 0, stats });
-        id
+        let shard = self.slots.len();
+        let source = (self.redundancy > 1).then(|| Arc::new(ShardSource::new(shard, self.redundancy)));
+        let mut slot = Slot {
+            txs: Vec::new(),
+            count: 0,
+            stats: Vec::new(),
+            source: source.clone(),
+        };
+        for index in 0..self.redundancy {
+            let (tx, rx) = mpsc::unbounded_channel();
+            let stats = Arc::new(ConnStats::default());
+            let mut conn = Connection::new(
+                shard * self.redundancy + index,
+                self.cfg.clone(),
+                self.out.clone(),
+                Arc::clone(&stats),
+                self.discovery.clone(),
+            );
+            if let Some(shard) = &source {
+                conn = conn.with_member(Member {
+                    index,
+                    shard: Arc::clone(shard),
+                });
+            }
+            self.tasks
+                .spawn(conn.run(rx, self.ticks.clone(), self.shutdown.clone()));
+            slot.txs.push(tx);
+            slot.stats.push(stats);
+        }
+        self.slots.push(slot);
+        shard
     }
 }
 
@@ -241,6 +287,20 @@ mod tests {
         assert_eq!(counts(&m), [3, 3, 1], "fills the emptier connection first");
         assert!(!m.contains("s0"));
         assert!(m.contains("s12"));
+        shutdown.cancel();
+        m.join().await;
+        writer.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn redundant_shards_have_every_member_and_count_once() {
+        let (m, writer, shutdown, _dir) = manager(3);
+        let mut m = m.with_redundancy(2);
+        assert_eq!(m.add(syms(0..4)), 4);
+        // Two shards (3 + 1 symbols), two connections each.
+        assert_eq!(counts(&m), [3, 3, 1, 1]);
+        assert_eq!(m.len(), 4);
+        assert_eq!(m.sources().len(), 2);
         shutdown.cancel();
         m.join().await;
         writer.join().unwrap();

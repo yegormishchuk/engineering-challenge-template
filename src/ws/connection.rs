@@ -41,7 +41,7 @@ use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
 use indexmap::IndexSet;
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{OwnedMutexGuard, mpsc, watch};
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
@@ -50,7 +50,8 @@ use tracing::{debug, info, warn};
 
 use crate::books::{Books, BooksError, SnapshotApplied};
 use crate::exchange::{Event, polymarket};
-use crate::writer::{OutSender, WriterGone};
+use crate::writer::{OutMsg, OutSender, WriterGone};
+use crate::ws::source::{ShardSource, State as SourceState};
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -222,6 +223,11 @@ pub struct ConnStats {
     pub busy_us: AtomicU64,
     /// Longest single frame handling time, in µs.
     pub max_frame_us: AtomicU64,
+    /// Snapshots written because this connection became its shard's source.
+    pub switch_snapshots: AtomicU64,
+    /// Symbols without a live book when this connection became the source:
+    /// nothing is written for them until their next book.
+    pub switch_without_baseline: AtomicU64,
 }
 
 fn inc(counter: &AtomicU64) {
@@ -248,8 +254,19 @@ fn level_set(bids: &[(i64, i64)], asks: &[(i64, i64)]) -> LevelSet {
         .collect()
 }
 
+/// This connection's place in a shard of redundant connections.
+#[derive(Debug, Clone)]
+pub struct Member {
+    pub index: usize,
+    pub shard: Arc<ShardSource>,
+}
+
 pub struct Connection {
     id: usize,
+    /// `None`: the only connection for its symbols, always writes.
+    member: Option<Member>,
+    /// The shard's switch epoch this connection last wrote under.
+    seen_epoch: u64,
     cfg: ConnectionConfig,
     /// In the order they were added, so a market's tokens (added together)
     /// stay in the same subscription batch after a reconnect.
@@ -333,6 +350,8 @@ impl Connection {
     ) -> Self {
         Self {
             id,
+            member: None,
+            seen_epoch: 0,
             cfg,
             symbols: IndexSet::new(),
             books: Books::new(),
@@ -356,6 +375,53 @@ impl Connection {
             gave_up: HashSet::new(),
             verify_not_before: Instant::now(),
             verify_backoff: Duration::ZERO,
+        }
+    }
+
+    /// Makes this connection one of a shard's redundant members.
+    pub fn with_member(mut self, member: Member) -> Self {
+        self.member = Some(member);
+        self
+    }
+
+    /// Takes the shard's output lock and decides whether this connection
+    /// writes. `None`: not the source, drop the output. `Some(guard)`: write
+    /// while holding the guard (no guard without a shard). A connection that
+    /// has just become the source first writes a snapshot of every symbol
+    /// with a live book.
+    async fn begin_output(&mut self) -> Result<Option<Option<OwnedMutexGuard<SourceState>>>, WriterGone> {
+        let Some(member) = &self.member else {
+            return Ok(Some(None));
+        };
+        let (shard, me) = (Arc::clone(&member.shard), member.index);
+        let mut st = shard.lock_owned().await;
+        if !shard.take_over_if_source_down(&mut st, me) {
+            return Ok(None);
+        }
+        if st.epoch != self.seen_epoch {
+            self.seen_epoch = st.epoch;
+            let mut written = 0;
+            for msg in self.books.minute_snapshots(Utc::now()) {
+                self.out.send(msg).await?;
+                written += 1;
+            }
+            add(&self.stats.switch_snapshots, written);
+            add(&self.stats.switch_without_baseline, self.symbols.len().saturating_sub(written));
+        }
+        Ok(Some(Some(st)))
+    }
+
+    /// Writes one message if this connection is its shard's source.
+    async fn emit(&mut self, msg: OutMsg) -> Result<(), WriterGone> {
+        let Some(_guard) = self.begin_output().await? else {
+            return Ok(());
+        };
+        self.out.send(msg).await
+    }
+
+    fn report_baselines(&self) {
+        if let Some(m) = &self.member {
+            m.shard.set_baselines(m.index, self.books.live_len());
         }
     }
 
@@ -394,6 +460,9 @@ impl Connection {
             };
             match connected {
                 Ok(Ok((ws, _))) => {
+                    if let Some(m) = &self.member {
+                        m.shard.connected(m.index).await;
+                    }
                     inc(&self.stats.connects);
                     info!(conn = self.id, symbols = self.symbols.len(), "connected");
                     let started = Instant::now();
@@ -402,9 +471,15 @@ impl Connection {
                     // old ones stay only for comparison.
                     self.books.mark_all_stale();
                     self.to_verify.clear();
+                    self.report_baselines();
                     match end {
                         Ok(SessionEnd::Shutdown) => return Ok(()),
                         Ok(SessionEnd::Lost(reason)) => {
+                            // Hand over before logging, so the peer can
+                            // write while this one reconnects.
+                            if let Some(m) = &self.member {
+                                m.shard.lost(m.index).await;
+                            }
                             inc(&self.stats.disconnects);
                             warn!(conn = self.id, %reason, "connection lost");
                             if started.elapsed() >= self.cfg.stable_after {
@@ -531,7 +606,13 @@ impl Connection {
                     inc(&self.stats.frames);
                     add(&self.stats.bytes, text.len());
                     let busy = std::time::Instant::now();
+                    // Settle who writes before applying the frame, so a
+                    // switch snapshot shows the books as they were before it.
+                    if self.member.is_some() {
+                        drop(self.begin_output().await?);
+                    }
                     let result = self.on_text(&mut ws, &text, received_at, &mut last_pong).await;
+                    self.report_baselines();
                     let us = busy.elapsed().as_micros() as u64;
                     self.stats.busy_us.fetch_add(us, Ordering::Relaxed);
                     self.stats.max_frame_us.fetch_max(us, Ordering::Relaxed);
@@ -611,10 +692,12 @@ impl Connection {
                         self.ticks_open = false;
                         continue;
                     }
-                    let emitted_at = Utc::now();
-                    for msg in self.books.minute_snapshots(emitted_at) {
-                        self.out.send(msg).await?;
-                        inc(&self.stats.minute_snapshots);
+                    if let Some(_guard) = self.begin_output().await? {
+                        let emitted_at = Utc::now();
+                        for msg in self.books.minute_snapshots(emitted_at) {
+                            self.out.send(msg).await?;
+                            inc(&self.stats.minute_snapshots);
+                        }
                     }
                 }
             }
@@ -700,7 +783,7 @@ impl Connection {
                     Ok(applied) => {
                         inc(&self.stats.books);
                         self.note_mismatches(&symbol, &applied);
-                        self.out.send(applied.msg).await?;
+                        self.emit(applied.msg).await?;
                     }
                     Err(error) => {
                         warn!(conn = self.id, %error, "invalid exchange book; resyncing");
@@ -741,7 +824,7 @@ impl Connection {
                 match self.books.apply_level(&symbol, side, price, quantity, exchange_ts, received_at) {
                     Ok(msg) => {
                         inc(&self.stats.levels);
-                        self.out.send(msg).await?;
+                        self.emit(msg).await?;
                     }
                     Err(BooksError::NoBaseline { .. }) => inc(&self.stats.skipped_no_baseline),
                     Err(error) => {
@@ -906,7 +989,7 @@ impl Connection {
         if self.cfg.verify.is_some() && !self.gave_up.contains(symbol) {
             self.to_verify.push(symbol.to_owned());
         }
-        self.out.send(applied.msg).await
+        self.emit(applied.msg).await
     }
 
     /// Starts one REST check of up to `batch` assumed-empty symbols. Runs in

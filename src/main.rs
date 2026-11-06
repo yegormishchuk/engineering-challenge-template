@@ -68,6 +68,11 @@ struct Args {
     #[arg(long, default_value_t = 10.0)]
     verify_rate: f64,
 
+    /// Connections per shard, all subscribed to the same symbols; one writes
+    /// at a time and the others take over when it fails (1 = no redundancy).
+    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u64).range(1..=4))]
+    redundancy: u64,
+
     /// Seconds between counter logs.
     #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
     stats_every: u64,
@@ -127,7 +132,8 @@ async fn main() -> anyhow::Result<()> {
         ticks,
         shutdown.clone(),
         Some(discovery_tx),
-    );
+    )
+    .with_redundancy(args.redundancy as usize);
 
     let mut tracker = Tracker::new(TrackerConfig {
         max_markets: args.max_markets,
@@ -237,10 +243,21 @@ fn log_stats(shards: &ShardManager) {
             ignored = s.ignored.load(Relaxed),
             dropped_during_resync = s.dropped_during_resync.load(Relaxed),
             gap_mismatched_books = s.gap_mismatched_books.load(Relaxed),
+            switch_snapshots = s.switch_snapshots.load(Relaxed),
+            switch_without_baseline = s.switch_without_baseline.load(Relaxed),
             mb = s.bytes.load(Relaxed) / 1_000_000,
             busy_ms = s.busy_us.load(Relaxed) / 1000,
             max_frame_us = s.max_frame_us.load(Relaxed),
             "connection stats"
+        );
+    }
+    for src in shards.sources() {
+        info!(
+            shard = src.shard,
+            // Connection id of the source; absent if the lock was busy.
+            source = src.try_source().map(|m| src.shard * src.members() + m),
+            source_switches = src.switches.load(Relaxed),
+            "shard source"
         );
     }
 }

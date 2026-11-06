@@ -76,6 +76,11 @@ impl Books {
         self.books.get(symbol)
     }
 
+    /// Books that are baselines (not stale).
+    pub fn live_len(&self) -> usize {
+        self.books.len() - self.stale.len()
+    }
+
     /// Whether the symbol has a book that changes can be applied to.
     pub fn has_baseline(&self, symbol: &str) -> bool {
         self.books.contains_key(symbol) && !self.stale.contains(symbol)
