@@ -74,17 +74,23 @@ async fn main() -> anyhow::Result<()> {
     info!(output = %output.path().display(), "writer started");
 
     let shutdown = CancellationToken::new();
+    // SIGINT (Ctrl+C) and SIGTERM (`docker stop`, systemd) both shut down
+    // cleanly; a second signal exits at once.
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     tokio::spawn({
         let shutdown = shutdown.clone();
         async move {
-            if tokio::signal::ctrl_c().await.is_ok() {
-                info!("SIGINT: shutting down (press again to force)");
-                shutdown.cancel();
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => info!("SIGINT: shutting down (send again to force)"),
+                _ = sigterm.recv() => info!("SIGTERM: shutting down (send again to force)"),
             }
-            if tokio::signal::ctrl_c().await.is_ok() {
-                warn!("second SIGINT: exiting without flushing");
-                std::process::exit(130);
+            shutdown.cancel();
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = sigterm.recv() => {}
             }
+            warn!("second signal: exiting without flushing");
+            std::process::exit(130);
         }
     });
 
@@ -213,6 +219,8 @@ fn log_stats(shards: &ShardManager) {
             assumed_empty = s.assumed_empty.load(Relaxed),
             empty_confirmed = s.empty_confirmed.load(Relaxed),
             empty_wrong = s.empty_wrong.load(Relaxed),
+            empty_gave_up = s.empty_gave_up.load(Relaxed),
+            dropped_during_resync = s.dropped_during_resync.load(Relaxed),
             gap_mismatched_books = s.gap_mismatched_books.load(Relaxed),
             mb = s.bytes.load(Relaxed) / 1_000_000,
             busy_ms = s.busy_us.load(Relaxed) / 1000,

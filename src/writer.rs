@@ -10,7 +10,10 @@
 //!
 //! A message that cannot be encoded (for example a timestamp before 1970) is
 //! skipped and counted; it never costs the rest of the buffered chunk. An I/O
-//! error is fatal: the writer still tries to flush what it holds, then stops.
+//! error is fatal and stops the writer. It does not retry the flush: a failed
+//! `write_all` may have written part of the chunk, and writing the whole chunk
+//! again after it would misalign every later chunk and make the file
+//! unreadable.
 //!
 //! The writer never flushes on a timer: every `flush()` pads the chunk to the
 //! full 64 MiB, so periodic flushes would mostly write zeros (see the spec,
@@ -198,10 +201,8 @@ fn run(mut writer: AlignedSbeWriter, mut rx: Receiver<OutMsg>, stats: &WriterSta
                 counter.fetch_add(1, Ordering::Relaxed);
             }
             Err(error) if error.downcast_ref::<std::io::Error>().is_some() => {
-                // Disk or pipe failure. Keep what can still be kept.
-                if let Err(flush) = writer.flush() {
-                    tracing::error!(error = %flush, "flush after a write error also failed");
-                }
+                // Disk or pipe failure. See the module docs on why there is
+                // no retry.
                 return Err(error.context("writing output"));
             }
             Err(error) => {
@@ -387,26 +388,30 @@ mod tests {
         assert_eq!(read_all(output.path()).len(), 2);
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn async_send_waits_without_blocking_the_runtime() {
-        let dir = tempfile::tempdir().unwrap();
-        let output = Output::File(dir.path().join("out.sbe"));
-        let (tx, handle) = spawn(&output, 1).unwrap();
-        // With one worker thread, a blocking send would starve this task.
-        let ticker = tokio::spawn(async {
-            for _ in 0..20 {
-                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-            }
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_full_channel_suspends_only_the_sending_task() {
+        // A sender with nobody draining: the channel stays full.
+        let (raw_tx, mut rx) = mpsc::channel(1);
+        let tx = OutSender {
+            tx: raw_tx,
+            stats: Arc::new(WriterStats::default()),
+        };
+        let msg = |i| OutMsg::Update(level_update("A", Side::Buy, 1, i, ts(i), ts(i)));
+        tx.send(msg(1)).await.unwrap();
+
+        // On a single-threaded runtime a blocking send in this task would
+        // freeze the thread, and the test would never get past `sleep`.
+        let waiting = tokio::spawn({
+            let tx = tx.clone();
+            async move { tx.send(msg(2)).await }
         });
-        for i in 0..5_000 {
-            tx.send(OutMsg::Update(level_update("A", Side::Buy, 1, i, ts(i), ts(i))))
-                .await
-                .unwrap();
-        }
-        ticker.await.unwrap();
-        drop(tx);
-        let summary = tokio::task::spawn_blocking(move || handle.join()).await.unwrap().unwrap();
-        assert_eq!(summary.updates, 5_000);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!waiting.is_finished(), "the send waits for room");
+        assert_eq!(tx.stats().backpressure.load(Ordering::Relaxed), 1);
+
+        assert!(rx.recv().await.is_some());
+        waiting.await.unwrap().unwrap();
+        assert!(rx.recv().await.is_some());
     }
 
     #[test]

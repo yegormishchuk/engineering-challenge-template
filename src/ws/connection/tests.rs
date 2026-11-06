@@ -29,6 +29,7 @@ fn fast_cfg(url: String) -> ConnectionConfig {
         pong_timeout: Duration::from_secs(5),
         connect_timeout: Duration::from_secs(2),
         close_timeout: Duration::from_millis(500),
+        send_timeout: Duration::from_secs(2),
         backoff_min: Duration::from_millis(20),
         backoff_max: Duration::from_millis(100),
         stable_after: Duration::from_secs(60),
@@ -84,6 +85,28 @@ async fn next_text(ws: &mut ServerWs, log: &Mutex<Vec<String>>, answer_pings: bo
 /// Keeps a session open, answering PINGs and logging everything else.
 async fn idle(mut ws: ServerWs, log: Arc<Mutex<Vec<String>>>) {
     while next_text(&mut ws, &log, true).await.is_some() {}
+}
+
+/// Keeps reading for `dur`, answering PINGs, then returns the socket.
+async fn answer_for(ws: &mut ServerWs, log: &Mutex<Vec<String>>, dur: Duration) {
+    let _ = tokio::time::timeout(dur, async {
+        while next_text(ws, log, true).await.is_some() {}
+    })
+    .await;
+}
+
+/// Reads for `dur` without answering PINGs, like a server that is still
+/// sending earlier data.
+async fn ignore_pings_for(ws: &mut ServerWs, log: &Mutex<Vec<String>>, dur: Duration) {
+    let _ = tokio::time::timeout(dur, async {
+        while next_text(ws, log, false).await.is_some() {}
+    })
+    .await;
+}
+
+/// A change for B with the given exchange timestamp.
+fn change_b_at(ms: i64) -> String {
+    CHANGE_B.replace("1793822781002", &ms.to_string())
 }
 
 async fn send(ws: &mut ServerWs, text: &str) {
@@ -397,7 +420,7 @@ async fn token_without_a_book_gets_an_empty_baseline_and_later_changes_apply() {
     let (url, _log) = mock_server(|_, mut ws, log| async move {
         next_text(&mut ws, &log, true).await;
         send(&mut ws, BOOK_A).await; // B never gets a book: it has no orders
-        tokio::time::sleep(Duration::from_millis(1500)).await;
+        answer_for(&mut ws, &log, Duration::from_millis(800)).await;
         // B's first order arrives as a change.
         send(&mut ws, CHANGE_B).await;
         idle(ws, log).await;
@@ -422,8 +445,8 @@ async fn a_late_book_after_an_empty_guess_is_a_checkpoint() {
         let book_b = book_b.clone();
         async move {
             next_text(&mut ws, &log, true).await;
-            tokio::time::sleep(Duration::from_millis(1500)).await;
-            send(&mut ws, &book_b).await; // far later than the grace period
+            answer_for(&mut ws, &log, Duration::from_millis(800)).await;
+            send(&mut ws, &book_b).await; // after the empty guess
             idle(ws, log).await;
         }
     })
@@ -443,9 +466,11 @@ async fn a_late_book_after_an_empty_guess_is_a_checkpoint() {
 async fn an_overdue_change_creates_the_empty_baseline_at_once() {
     let (url, _log) = mock_server(|_, mut ws, log| async move {
         next_text(&mut ws, &log, true).await;
-        send(&mut ws, CHANGE_B).await; // too early: B may still get a book
-        tokio::time::sleep(Duration::from_millis(400)).await;
-        send(&mut ws, CHANGE_B).await; // overdue: B's book is empty
+        let now = Utc::now().timestamp_millis();
+        // Too early by exchange time: B's book may still be on its way.
+        send(&mut ws, &change_b_at(now)).await;
+        // Exchange time well after the subscription: B's book is empty.
+        send(&mut ws, &change_b_at(now + 1_000)).await;
         idle(ws, log).await;
     })
     .await;
@@ -455,7 +480,13 @@ async fn an_overdue_change_creates_the_empty_baseline_at_once() {
     eventually("second change applied", || h.get(|s| &s.levels) == 1).await;
     assert_eq!(h.get(|s| &s.skipped_no_baseline), 1);
     assert_eq!(h.get(|s| &s.assumed_empty), 1);
-    assert_eq!(kinds(&h.finish().await), ["S:B", "U:B:1000000"]);
+    let msgs = h.finish().await;
+    assert_eq!(kinds(&msgs), ["S:B", "U:B:1000000"]);
+    let (OutMsg::Snapshot(base), OutMsg::Update(u)) = (&msgs[0], &msgs[1]) else { panic!() };
+    assert!(
+        base.received_at <= u.backtest_timestamp,
+        "the baseline must not come after the change that needs it"
+    );
 }
 
 #[tokio::test]
@@ -536,6 +567,8 @@ fn verify_cfg(url: String) -> Option<VerifyConfig> {
         url,
         batch: 200,
         every: Duration::from_millis(50),
+        max_backoff: Duration::from_millis(200),
+        give_up_after: 3,
     })
 }
 
@@ -638,5 +671,74 @@ async fn first_book_after_a_reconnect_is_compared_with_the_old_book() {
     eventually("second book", || h.get(|s| &s.books) == 2).await;
     assert_eq!(h.get(|s| &s.gap_mismatched_books), 1);
     assert_eq!(h.get(|s| &s.mismatched_books), 0, "a change during the gap is not a missed message");
+    h.finish().await;
+}
+
+#[tokio::test]
+async fn a_lagging_reader_does_not_guess_empty_while_books_may_be_unread() {
+    let (url, _log) = mock_server(|_, mut ws, log| async move {
+        next_text(&mut ws, &log, true).await;
+        // The server is slow: PINGs go unanswered for a while, well past the
+        // grace period, and then the book arrives.
+        ignore_pings_for(&mut ws, &log, Duration::from_millis(900)).await;
+        send(&mut ws, &BOOK_A.replace("\"A\"", "\"B\"")).await;
+        idle(ws, log).await;
+    })
+    .await;
+    let mut cfg = fast_cfg(url);
+    cfg.empty_book_after = Duration::from_millis(100);
+    let h = start(cfg, &["B"]);
+    eventually("book", || h.get(|s| &s.books) == 1).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(h.get(|s| &s.assumed_empty), 0, "no guess before the PONG barrier");
+    assert_eq!(h.get(|s| &s.mismatched_books), 0);
+    h.finish().await;
+}
+
+#[tokio::test]
+async fn a_book_in_flight_during_a_resync_is_dropped() {
+    let bad = CHANGE_A.replace("\"BUY\"", "\"HOLD\"");
+    let (url, log) = mock_server(move |_, mut ws, log| {
+        let bad = bad.clone();
+        async move {
+            next_text(&mut ws, &log, true).await; // subscribe A
+            send(&mut ws, BOOK_A).await;
+            send(&mut ws, &bad).await; // the client resyncs A
+            next_text(&mut ws, &log, true).await; // unsubscribe A
+            send(&mut ws, BOOK_A).await; // sent before the unsubscribe took effect
+            next_text(&mut ws, &log, true).await; // subscribe A again
+            send(&mut ws, &BOOK_A.replace("\"10\"", "\"12\"")).await;
+            idle(ws, log).await;
+        }
+    })
+    .await;
+    let mut cfg = fast_cfg(url);
+    cfg.subscribe_pace = Duration::from_millis(300);
+    let h = start(cfg, &["A"]);
+    eventually("fresh book after resync", || h.get(|s| &s.books) == 2).await;
+    assert_eq!(h.get(|s| &s.dropped_during_resync), 1);
+    assert_eq!(h.get(|s| &s.mismatched_books), 0, "the stale book was not a baseline");
+    assert!(log.lock().unwrap()[1].contains("unsubscribe"));
+    let msgs = h.finish().await;
+    let OutMsg::Snapshot(last) = msgs.last().unwrap() else { panic!() };
+    assert_eq!(last.bids[0].quantity, 12_000_000);
+}
+
+#[tokio::test]
+async fn repeated_wrong_empty_guesses_give_up() {
+    let (ws_url, _log) = mock_server(|_, ws, log| idle(ws, log)).await;
+    let (http_url, _requests) = mock_books_http(&["B"]).await;
+    let mut cfg = fast_cfg(ws_url);
+    cfg.empty_book_after = Duration::from_millis(50);
+    cfg.verify = verify_cfg(http_url).map(|mut v| {
+        v.give_up_after = 2;
+        v
+    });
+    let h = start(cfg, &["B"]);
+    eventually("gave up", || h.get(|s| &s.empty_gave_up) == 1).await;
+    let resyncs = h.get(|s| &s.resyncs);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(h.get(|s| &s.resyncs), resyncs, "no more resyncs after giving up");
+    assert_eq!(h.get(|s| &s.empty_wrong), 2);
     h.finish().await;
 }

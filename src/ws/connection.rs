@@ -20,10 +20,17 @@
 //! with that next book and the result is counted as `gap_mismatched_books`.
 //!
 //! Polymarket sends no `book` for a token without orders, so a symbol still
-//! without one `empty_book_after` its subscription gets an empty baseline,
-//! and the guess is checked against the batch REST endpoint.
+//! without one gets an empty baseline, and the guess is checked against the
+//! batch REST endpoint. The guess must not depend on how fast we read: under
+//! load a book can sit unread in the socket long after it was sent. So it is
+//! made only when the stream itself proves the book is not coming:
+//! - a `PONG` arrived for a `PING` sent after the subscription (the server
+//!   answers in order, so a book would have come first), and at least
+//!   `empty_book_after` has passed; or
+//! - a change arrives for the symbol whose *exchange* timestamp is at least
+//!   `empty_book_on_change_after` later than the subscription.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -54,7 +61,13 @@ pub struct VerifyConfig {
     /// Symbols per request.
     pub batch: usize,
     /// At most one request in flight per connection, at most this often.
+    /// After a failed request the wait doubles, up to `max_backoff`.
     pub every: Duration,
+    pub max_backoff: Duration,
+    /// After this many REST results showing orders for a book the websocket
+    /// never sends, stop checking the symbol (it would otherwise resync
+    /// forever).
+    pub give_up_after: u32,
 }
 
 impl VerifyConfig {
@@ -64,6 +77,8 @@ impl VerifyConfig {
             url: polymarket::BOOKS_URL.to_owned(),
             batch: 200,
             every: Duration::from_secs(2),
+            max_backoff: Duration::from_secs(60),
+            give_up_after: 3,
         }
     }
 }
@@ -76,6 +91,9 @@ pub struct ConnectionConfig {
     pub connect_timeout: Duration,
     /// How long a websocket Close may take at shutdown before giving up.
     pub close_timeout: Duration,
+    /// How long any other websocket send may take; a peer that stops reading
+    /// would otherwise block the session, including shutdown.
+    pub send_timeout: Duration,
     pub backoff_min: Duration,
     pub backoff_max: Duration,
     /// A session shorter than this does not reset the backoff, so a server
@@ -88,17 +106,16 @@ pub struct ConnectionConfig {
     /// overflows the server's send buffer for the socket, and it closes the
     /// connection with "slow consumer: send buffer full" (seen in M4).
     pub subscribe_pace: Duration,
-    /// A symbol with no `book` this long after its subscription was sent is
-    /// taken to have an empty book. Polymarket sends no `book` for tokens
-    /// without orders (REST answers 404 for them); their first order arrives
-    /// as a `price_change`, which needs a baseline. Books arrive within 0.74 s
-    /// of subscribing (p99, 2000 tokens, M5), so 5 s leaves a wide margin; if
-    /// a book does come later, it is a checkpoint and corrects the guess.
+    /// Minimum wait after a subscription before its symbol may be taken to
+    /// have an empty book, on top of the `PING`/`PONG` barrier. Polymarket
+    /// sends no `book` for tokens without orders (REST answers 404 for
+    /// them); their first order arrives as a `price_change`, which needs a
+    /// baseline. Books arrive within 0.74 s of subscribing (p99, 2000 tokens).
     pub empty_book_after: Duration,
-    /// A level change for a symbol still waiting for its `book` this long
-    /// after subscribing means the book is empty: books arrive within 0.74 s
-    /// (p99). The change is then applied to an empty baseline at once,
-    /// instead of being skipped until `empty_book_after`.
+    /// A change whose exchange timestamp is this much later than the
+    /// subscription of a symbol still waiting for its `book` means the book
+    /// is empty; the change is applied to an empty baseline at once. Exchange
+    /// time, not read time, so a lagging reader cannot trigger it early.
     pub empty_book_on_change_after: Duration,
     pub verify: Option<VerifyConfig>,
 }
@@ -111,6 +128,7 @@ impl Default for ConnectionConfig {
             pong_timeout: Duration::from_secs(30),
             connect_timeout: Duration::from_secs(10),
             close_timeout: Duration::from_secs(2),
+            send_timeout: Duration::from_secs(10),
             backoff_min: Duration::from_millis(500),
             backoff_max: Duration::from_secs(30),
             stable_after: Duration::from_secs(30),
@@ -155,7 +173,11 @@ pub struct ConnStats {
     /// Assumed-empty books confirmed by REST, and ones REST showed orders for.
     pub empty_confirmed: AtomicU64,
     pub empty_wrong: AtomicU64,
+    /// Symbols no longer checked after `give_up_after` wrong results.
+    pub empty_gave_up: AtomicU64,
     pub verify_errors: AtomicU64,
+    /// Book messages dropped because their symbol was being resynced.
+    pub dropped_during_resync: AtomicU64,
     /// Bytes of text frames received.
     pub bytes: AtomicU64,
     /// Time spent handling frames (decode, books, queueing output), in µs.
@@ -197,10 +219,26 @@ pub struct Connection {
     /// Whether the current socket has sent its initial subscription.
     initial_sent: bool,
     /// Symbols subscribed on the current socket that have no `book` yet, with
-    /// the time their subscription was sent.
-    awaiting_book: HashMap<String, Instant>,
+    /// the time their subscription was sent (monotonic, and wall clock for
+    /// comparing with exchange timestamps).
+    awaiting_book: HashMap<String, (Instant, DateTime<Utc>)>,
+    /// Send times of `PING`s not yet answered, oldest first.
+    pings: VecDeque<Instant>,
+    /// Send time of the newest `PING` answered by a `PONG`.
+    acked_through: Option<Instant>,
+    /// Symbols unsubscribed for a resync whose new subscription is not sent
+    /// yet. Their book messages are still in flight from before and are
+    /// dropped, so they cannot become a baseline.
+    resyncing: HashSet<String>,
+    /// Symbols whose current baseline is an empty guess, not an exchange book.
+    assumed: HashSet<String>,
     /// Assumed-empty symbols waiting for a REST check.
     to_verify: Vec<String>,
+    /// Wrong empty guesses per symbol, and symbols no longer checked.
+    wrong_guesses: HashMap<String, u32>,
+    gave_up: HashSet<String>,
+    verify_not_before: Instant,
+    verify_backoff: Duration,
 }
 
 enum SessionEnd {
@@ -240,7 +278,15 @@ impl Connection {
             pending: VecDeque::new(),
             initial_sent: false,
             awaiting_book: HashMap::new(),
+            pings: VecDeque::new(),
+            acked_through: None,
+            resyncing: HashSet::new(),
+            assumed: HashSet::new(),
             to_verify: Vec::new(),
+            wrong_guesses: HashMap::new(),
+            gave_up: HashSet::new(),
+            verify_not_before: Instant::now(),
+            verify_backoff: Duration::ZERO,
         }
     }
 
@@ -317,11 +363,34 @@ impl Connection {
             Command::Add(symbols) => self.symbols.extend(symbols),
             Command::Remove(symbols) => {
                 for s in &symbols {
-                    self.symbols.shift_remove(s);
-                    self.books.remove(s);
+                    self.forget(s);
                 }
             }
         }
+    }
+
+    /// Drops everything known about a symbol that is no longer ours.
+    fn forget(&mut self, s: &str) -> bool {
+        self.books.remove(s);
+        self.awaiting_book.remove(s);
+        self.resyncing.remove(s);
+        self.assumed.remove(s);
+        self.wrong_guesses.remove(s);
+        self.gave_up.remove(s);
+        self.symbols.shift_remove(s)
+    }
+
+    async fn ws_send(&self, ws: &mut Ws, text: String) -> Result<(), String> {
+        match tokio::time::timeout(self.cfg.send_timeout, ws.send(Message::text(text))).await {
+            Ok(result) => result.map_err(|e| e.to_string()),
+            Err(_) => Err(format!("websocket send timed out after {:?}", self.cfg.send_timeout)),
+        }
+    }
+
+    async fn send_ping(&mut self, ws: &mut Ws) -> Result<(), String> {
+        self.ws_send(ws, polymarket::PING.to_owned()).await?;
+        self.pings.push_back(Instant::now());
+        Ok(())
     }
 
     async fn close(&self, ws: &mut Ws) {
@@ -340,7 +409,16 @@ impl Connection {
         self.pending = self.symbols.iter().cloned().collect();
         self.initial_sent = false;
         self.awaiting_book.clear();
-        let mut empty_check = tokio::time::interval(Duration::from_secs(1));
+        self.pings.clear();
+        self.acked_through = None;
+        // Everything is resubscribed from scratch; old guesses are stale.
+        self.resyncing.clear();
+        self.assumed.clear();
+        let empty_every = self
+            .cfg
+            .empty_book_after
+            .clamp(Duration::from_millis(10), Duration::from_secs(1));
+        let mut empty_check = tokio::time::interval(empty_every);
         empty_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // The first tick is immediate, so the first batch goes out at once.
         let mut pace = tokio::time::interval(self.cfg.subscribe_pace);
@@ -395,7 +473,10 @@ impl Connection {
                 _ = empty_check.tick(), if !self.awaiting_book.is_empty() => {
                     self.assume_empty_books().await?;
                 }
-                _ = verify_tick.tick(), if !verify_in_flight && !self.to_verify.is_empty() && self.cfg.verify.is_some() => {
+                _ = verify_tick.tick(), if !verify_in_flight
+                    && !self.to_verify.is_empty()
+                    && self.cfg.verify.is_some()
+                    && Instant::now() >= self.verify_not_before => {
                     verify_in_flight = true;
                     self.start_verify(verified_tx.clone());
                 }
@@ -413,8 +494,8 @@ impl Connection {
                             "no PONG for {:?}", last_pong.elapsed()
                         )));
                     }
-                    if let Err(e) = ws.send(Message::text(polymarket::PING)).await {
-                        return Ok(SessionEnd::Lost(e.to_string()));
+                    if let Err(reason) = self.send_ping(&mut ws).await {
+                        return Ok(SessionEnd::Lost(reason));
                     }
                 }
                 cmd = cmds.recv() => {
@@ -434,11 +515,7 @@ impl Connection {
                         Some(Command::Remove(symbols)) => {
                             let gone: Vec<String> = symbols
                                 .into_iter()
-                                .filter(|s| {
-                                    self.books.remove(s);
-                                    self.awaiting_book.remove(s);
-                                    self.symbols.shift_remove(s)
-                                })
+                                .filter(|s| self.forget(s))
                                 .collect();
                             self.pending.retain(|p| !gone.contains(p));
                             self.to_verify.retain(|p| !gone.contains(p));
@@ -483,9 +560,8 @@ impl Connection {
                 return self.resync(ws, &all).await;
             }
         };
-        for event in decoded.events {
-            self.on_event(ws, event, received_at, last_pong).await?;
-        }
+        // Resync the symbols of failed messages first, so no other message of
+        // the same frame is applied to a book already known to be incomplete.
         for failure in decoded.failures {
             inc(&self.stats.decode_errors);
             let ours: Vec<String> = if failure.symbols.is_empty() {
@@ -505,6 +581,9 @@ impl Connection {
                 "undecodable book message; resyncing its symbols"
             );
             self.resync(ws, &ours).await?;
+        }
+        for event in decoded.events {
+            self.on_event(ws, event, received_at, last_pong).await?;
         }
         Ok(())
     }
@@ -527,7 +606,12 @@ impl Connection {
                 if !self.symbols.contains(&symbol) {
                     return Ok(()); // late message for a removed symbol
                 }
+                if self.resyncing.contains(&symbol) {
+                    inc(&self.stats.dropped_during_resync);
+                    return Ok(());
+                }
                 self.awaiting_book.remove(&symbol);
+                self.assumed.remove(&symbol);
                 match self.books.apply_snapshot(&symbol, bids, asks, exchange_ts, received_at) {
                     Ok(applied) => {
                         inc(&self.stats.books);
@@ -551,16 +635,24 @@ impl Connection {
                 if !self.symbols.contains(&symbol) {
                     return Ok(());
                 }
+                if self.resyncing.contains(&symbol) {
+                    inc(&self.stats.dropped_during_resync);
+                    return Ok(());
+                }
                 if !self.books.has_baseline(&symbol) {
+                    let margin = chrono::TimeDelta::from_std(self.cfg.empty_book_on_change_after)
+                        .unwrap_or(chrono::TimeDelta::MAX);
                     let overdue = self
                         .awaiting_book
                         .get(&symbol)
-                        .is_some_and(|sent| sent.elapsed() >= self.cfg.empty_book_on_change_after);
+                        .is_some_and(|(_, sent_at)| exchange_ts >= *sent_at + margin);
                     if !overdue {
                         inc(&self.stats.skipped_no_baseline);
                         return Ok(());
                     }
-                    self.assume_empty(&symbol).await?;
+                    // Stamped with this frame's receive time, so the baseline
+                    // never comes after the change that depends on it.
+                    self.assume_empty(&symbol, received_at).await?;
                 }
                 match self.books.apply_level(&symbol, side, price, quantity, exchange_ts, received_at) {
                     Ok(msg) => {
@@ -574,7 +666,15 @@ impl Connection {
                     }
                 }
             }
-            Event::Pong => *last_pong = Instant::now(),
+            Event::Pong => {
+                *last_pong = Instant::now();
+                if let Some(sent) = self.pings.pop_front() {
+                    self.acked_through = Some(sent);
+                    // The barrier just moved: books still missing now are
+                    // not coming.
+                    self.assume_empty_books().await?;
+                }
+            }
             event @ (Event::MarketAdded { .. } | Event::MarketResolved { .. }) => {
                 if let Some(tx) = &self.discovery {
                     let _ = tx.send(event);
@@ -626,6 +726,8 @@ impl Connection {
         for s in symbols {
             self.books.mark_stale(s);
             self.awaiting_book.remove(s);
+            self.assumed.remove(s);
+            self.resyncing.insert(s.clone());
         }
         self.to_verify.retain(|p| !symbols.contains(p));
         self.send_unsubscribe(ws, symbols).await.map_err(Stop::Lost)?;
@@ -645,9 +747,10 @@ impl Connection {
         if batch.is_empty() {
             return Ok(());
         }
-        let now = Instant::now();
+        let (now, now_utc) = (Instant::now(), Utc::now());
         for s in &batch {
-            self.awaiting_book.insert(s.clone(), now);
+            self.awaiting_book.insert(s.clone(), (now, now_utc));
+            self.resyncing.remove(s);
         }
         let msg = if self.initial_sent {
             polymarket::encode_subscribe(&batch)
@@ -655,41 +758,47 @@ impl Connection {
             polymarket::encode_initial_subscribe(&batch)
         };
         self.initial_sent = true;
-        ws.send(Message::text(msg)).await.map_err(|e| e.to_string())
+        self.ws_send(ws, msg).await?;
+        // The barrier: once this PING is answered, every book for the batch
+        // has been delivered (see the module docs).
+        self.send_ping(ws).await
     }
 
     /// Gives every symbol whose `book` is overdue an empty baseline and
     /// writes it as a snapshot.
     async fn assume_empty_books(&mut self) -> Result<(), WriterGone> {
         let grace = self.cfg.empty_book_after;
+        let Some(acked) = self.acked_through else {
+            return Ok(());
+        };
         let mut overdue: Vec<String> = self
             .awaiting_book
             .iter()
-            .filter(|(_, sent)| sent.elapsed() >= grace)
+            .filter(|(_, (sent, _))| sent.elapsed() >= grace && acked > *sent)
             .map(|(s, _)| s.clone())
             .collect();
         overdue.sort_unstable();
         for symbol in overdue {
-            self.assume_empty(&symbol).await?;
+            self.assume_empty(&symbol, Utc::now()).await?;
         }
         Ok(())
     }
 
-    /// Gives one symbol an empty baseline, unless it already has one. Its
-    /// exchange timestamp is the local time, since the exchange sent nothing.
-    async fn assume_empty(&mut self, symbol: &str) -> Result<(), WriterGone> {
+    /// Gives one symbol an empty baseline, unless it already has one, stamped
+    /// `at` (both timestamps: the exchange sent nothing).
+    async fn assume_empty(&mut self, symbol: &str, at: DateTime<Utc>) -> Result<(), WriterGone> {
         self.awaiting_book.remove(symbol);
         if self.books.has_baseline(symbol) {
             return Ok(());
         }
-        let now = Utc::now();
         let applied = self
             .books
-            .apply_snapshot(symbol, [], [], now, now)
+            .apply_snapshot(symbol, [], [], at, at)
             .expect("an empty book is always valid");
         inc(&self.stats.assumed_empty);
+        self.assumed.insert(symbol.to_owned());
         self.note_mismatches(symbol, &applied);
-        if self.cfg.verify.is_some() {
+        if self.cfg.verify.is_some() && !self.gave_up.contains(symbol) {
             self.to_verify.push(symbol.to_owned());
         }
         self.out.send(applied.msg).await
@@ -724,34 +833,52 @@ impl Connection {
     }
 
     async fn on_verified(&mut self, ws: &mut Ws, verified: Verified) -> Result<(), Stop> {
+        let Some(verify) = self.cfg.verify.clone() else {
+            return Ok(());
+        };
         let with_orders = match verified.result {
-            Ok(with_orders) => with_orders,
+            Ok(with_orders) => {
+                self.verify_backoff = Duration::ZERO;
+                with_orders
+            }
             Err(error) => {
                 inc(&self.stats.verify_errors);
-                debug!(conn = self.id, %error, "empty-book check failed; will retry");
-                // Retry later, keeping only symbols still ours.
-                let retry = verified
-                    .checked
-                    .into_iter()
-                    .filter(|s| self.symbols.contains(s));
+                self.verify_backoff = (self.verify_backoff * 2).clamp(verify.every, verify.max_backoff);
+                self.verify_not_before = Instant::now() + self.verify_backoff;
+                debug!(conn = self.id, %error, backoff = ?self.verify_backoff, "empty-book check failed; will retry");
+                // Retry later, keeping only symbols still assumed empty.
+                let retry = verified.checked.into_iter().filter(|s| self.assumed.contains(s));
                 self.to_verify.extend(retry);
                 return Ok(());
             }
         };
         let mut wrong = Vec::new();
-        for s in &verified.checked {
-            let still_empty = self
-                .books
-                .get(s)
-                .is_some_and(|b| self.books.has_baseline(s) && b.bids().is_empty() && b.asks().is_empty());
-            if with_orders.contains(s) && still_empty && self.symbols.contains(s) {
-                wrong.push(s.clone());
-            } else if !with_orders.contains(s) {
+        for s in verified.checked {
+            // Only symbols whose baseline is still the guess: a real exchange
+            // book since then has settled it either way.
+            if !self.assumed.contains(&s) {
+                continue;
+            }
+            if !with_orders.contains(&s) {
                 inc(&self.stats.empty_confirmed);
+                continue;
+            }
+            inc(&self.stats.empty_wrong);
+            let n = self.wrong_guesses.entry(s.clone()).or_default();
+            *n += 1;
+            if *n >= verify.give_up_after {
+                inc(&self.stats.empty_gave_up);
+                warn!(
+                    conn = self.id,
+                    symbol = %s,
+                    "REST keeps showing orders but the websocket sends no book; no longer checking"
+                );
+                self.gave_up.insert(s);
+            } else {
+                wrong.push(s);
             }
         }
         if !wrong.is_empty() {
-            add(&self.stats.empty_wrong, wrong.len());
             warn!(
                 conn = self.id,
                 symbols = wrong.len(),
@@ -770,9 +897,7 @@ impl Connection {
             return Ok(());
         }
         for chunk in symbols.chunks(self.cfg.subscribe_batch) {
-            ws.send(Message::text(polymarket::encode_unsubscribe(chunk)))
-                .await
-                .map_err(|e| e.to_string())?;
+            self.ws_send(ws, polymarket::encode_unsubscribe(chunk)).await?;
         }
         Ok(())
     }
