@@ -67,8 +67,10 @@ fn run(path: &str) -> anyhow::Result<bool> {
     println!("result:                    {}", if consistent { "CONSISTENT" } else { "INCONSISTENT" });
     if r.mismatched > 0 {
         println!(
-            "note: mismatched snapshots should equal the collector's mismatched_books; \
-             any extra means the file lost or reordered messages"
+            "note: mismatched snapshots should equal the collector's mismatched_books + \
+             gap_mismatched_books (summed over connections). Any extra means the file \
+             lost or reordered messages; a symbol removed and later re-added can also \
+             add one, since the collector starts it fresh."
         );
     }
     Ok(consistent)

@@ -18,9 +18,9 @@ use crate::writer::{self, OutMsg, Output};
 
 type ServerWs = tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>;
 
-const BOOK_A: &str = r#"{"event_type":"book","market":"m","asset_id":"A","timestamp":"1000","hash":"h","bids":[{"price":"0.40","size":"10"}],"asks":[{"price":"0.60","size":"20"}]}"#;
-const CHANGE_A: &str = r#"{"event_type":"price_change","market":"m","timestamp":"1001","price_changes":[{"asset_id":"A","price":"0.40","size":"15","side":"BUY","hash":"h2"}]}"#;
-const CHANGE_B: &str = r#"{"event_type":"price_change","market":"m","timestamp":"1002","price_changes":[{"asset_id":"B","price":"0.10","size":"1","side":"SELL","hash":"h3"}]}"#;
+const BOOK_A: &str = r#"{"event_type":"book","market":"m","asset_id":"A","timestamp":"1793822781000","hash":"h","bids":[{"price":"0.40","size":"10"}],"asks":[{"price":"0.60","size":"20"}]}"#;
+const CHANGE_A: &str = r#"{"event_type":"price_change","market":"m","timestamp":"1793822781001","price_changes":[{"asset_id":"A","price":"0.40","size":"15","side":"BUY","hash":"h2"}]}"#;
+const CHANGE_B: &str = r#"{"event_type":"price_change","market":"m","timestamp":"1793822781002","price_changes":[{"asset_id":"B","price":"0.10","size":"1","side":"SELL","hash":"h3"}]}"#;
 
 fn fast_cfg(url: String) -> ConnectionConfig {
     ConnectionConfig {
@@ -28,6 +28,7 @@ fn fast_cfg(url: String) -> ConnectionConfig {
         ping_interval: Duration::from_millis(50),
         pong_timeout: Duration::from_secs(5),
         connect_timeout: Duration::from_secs(2),
+        close_timeout: Duration::from_millis(500),
         backoff_min: Duration::from_millis(20),
         backoff_max: Duration::from_millis(100),
         stable_after: Duration::from_secs(60),
@@ -35,6 +36,7 @@ fn fast_cfg(url: String) -> ConnectionConfig {
         subscribe_pace: Duration::from_millis(5),
         empty_book_after: Duration::from_secs(60),
         empty_book_on_change_after: Duration::from_secs(60),
+        verify: None,
     }
 }
 
@@ -200,11 +202,11 @@ async fn subscribes_records_book_and_updates_and_skips_changes_without_baseline(
     let msgs = h.finish().await;
     assert_eq!(kinds(&msgs), ["S:A", "U:A:15000000", "S:A"]);
     let OutMsg::Update(u) = &msgs[1] else { panic!() };
-    assert_eq!(u.exchange_timestamp.timestamp_millis(), 1001);
+    assert_eq!(u.exchange_timestamp.timestamp_millis(), 1793822781001);
     assert!(u.backtest_timestamp > u.exchange_timestamp);
     let OutMsg::Snapshot(minute) = &msgs[2] else { panic!() };
     assert_eq!(minute.bids[0].quantity, 15_000_000);
-    assert_eq!(minute.exchange_timestamp.timestamp_millis(), 1001);
+    assert_eq!(minute.exchange_timestamp.timestamp_millis(), 1793822781001);
 }
 
 #[tokio::test]
@@ -473,5 +475,168 @@ async fn reconnect_resubscribes_in_insertion_order() {
         let v: serde_json::Value = serde_json::from_str(&log[1]).unwrap();
         assert_eq!(v["assets_ids"], serde_json::json!(["z-yes", "z-no", "a-yes", "a-no"]));
     }
+    h.finish().await;
+}
+
+/// A mock of the batch book endpoint: answers every POST with a book that has
+/// orders for each requested token listed in `with_orders`, and records the
+/// request bodies.
+async fn mock_books_http(with_orders: &'static [&'static str]) -> (String, Arc<Mutex<Vec<String>>>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/books", listener.local_addr().unwrap());
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&bodies);
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let log = Arc::clone(&log);
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let body = loop {
+                    let n = stream.read(&mut chunk).await.unwrap();
+                    if n == 0 {
+                        return;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    let text = String::from_utf8_lossy(&buf).to_string();
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let len: usize = text[..end]
+                            .lines()
+                            .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse().unwrap()))
+                            .unwrap_or(0);
+                        if buf.len() >= end + 4 + len {
+                            break text[end + 4..end + 4 + len].to_string();
+                        }
+                    }
+                };
+                let requested: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+                log.lock().unwrap().push(body);
+                let books: Vec<serde_json::Value> = requested
+                    .iter()
+                    .filter_map(|r| r["token_id"].as_str())
+                    .filter(|t| with_orders.contains(t))
+                    .map(|t| serde_json::json!({"asset_id": t, "bids": [{"price": "0.1", "size": "1"}], "asks": []}))
+                    .collect();
+                let out = serde_json::Value::Array(books).to_string();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{out}",
+                    out.len()
+                );
+                stream.write_all(resp.as_bytes()).await.unwrap();
+            });
+        }
+    });
+    (url, bodies)
+}
+
+fn verify_cfg(url: String) -> Option<VerifyConfig> {
+    Some(VerifyConfig {
+        http: reqwest::Client::new(),
+        url,
+        batch: 200,
+        every: Duration::from_millis(50),
+    })
+}
+
+#[tokio::test]
+async fn rest_confirms_an_assumed_empty_book() {
+    let (ws_url, log) = mock_server(|_, ws, log| idle(ws, log)).await;
+    let (http_url, requests) = mock_books_http(&[]).await;
+    let mut cfg = fast_cfg(ws_url);
+    cfg.empty_book_after = Duration::from_millis(200);
+    cfg.verify = verify_cfg(http_url);
+    let h = start(cfg, &["B"]);
+    eventually("confirmed empty", || h.get(|s| &s.empty_confirmed) == 1).await;
+    assert_eq!(h.get(|s| &s.empty_wrong), 0);
+    assert_eq!(requests.lock().unwrap().as_slice(), [r#"[{"token_id":"B"}]"#]);
+    assert_eq!(log.lock().unwrap().len(), 1, "no resubscribe");
+    h.finish().await;
+}
+
+#[tokio::test]
+async fn rest_showing_orders_for_an_assumed_empty_book_triggers_a_resync() {
+    let (ws_url, log) = mock_server(|_, ws, log| idle(ws, log)).await;
+    let (http_url, _requests) = mock_books_http(&["B"]).await;
+    let mut cfg = fast_cfg(ws_url);
+    cfg.empty_book_after = Duration::from_millis(200);
+    cfg.verify = verify_cfg(http_url);
+    let h = start(cfg, &["A", "B"]);
+    eventually("wrong guess found", || h.get(|s| &s.empty_wrong) >= 1).await;
+    eventually("unsubscribe + subscribe for B", || log.lock().unwrap().len() >= 3).await;
+    {
+        let log = log.lock().unwrap();
+        assert!(log[1].contains("unsubscribe") && log[1].contains("\"B\"") && !log[1].contains("\"A\""), "{log:?}");
+        assert!(log[2].contains("\"operation\":\"subscribe\"") && log[2].contains("\"B\""), "{log:?}");
+    }
+    assert_eq!(h.get(|s| &s.empty_confirmed), 1, "A was confirmed");
+    h.finish().await;
+}
+
+#[tokio::test]
+async fn a_bad_book_message_resyncs_only_its_symbols() {
+    let bad = CHANGE_A.replace("\"BUY\"", "\"HOLD\"");
+    let (url, log) = mock_server(move |_, mut ws, log| {
+        let bad = bad.clone();
+        async move {
+            next_text(&mut ws, &log, true).await;
+            send(&mut ws, BOOK_A).await;
+            send(&mut ws, &BOOK_A.replace("\"A\"", "\"B\"")).await;
+            send(&mut ws, &bad).await;
+            idle(ws, log).await;
+        }
+    })
+    .await;
+    let h = start(fast_cfg(url), &["A", "B"]);
+    eventually("resync", || h.get(|s| &s.resyncs) == 1).await;
+    eventually("resubscribe", || log.lock().unwrap().len() == 3).await;
+    assert_eq!(h.get(|s| &s.decode_errors), 1);
+    {
+        let log = log.lock().unwrap();
+        let unsub: serde_json::Value = serde_json::from_str(&log[1]).unwrap();
+        assert_eq!(unsub["assets_ids"], serde_json::json!(["A"]), "B is untouched");
+    }
+    h.finish().await;
+}
+
+#[tokio::test]
+async fn malformed_discovery_message_does_not_resync() {
+    let (url, _log) = mock_server(|_, mut ws, log| async move {
+        next_text(&mut ws, &log, true).await;
+        send(&mut ws, BOOK_A).await;
+        send(&mut ws, r#"{"event_type":"market_resolved","winning_asset_id":"1"}"#).await;
+        send(&mut ws, "SOME SERVER NOTICE").await;
+        send(&mut ws, CHANGE_A).await;
+        idle(ws, log).await;
+    })
+    .await;
+    let h = start(fast_cfg(url), &["A"]);
+    eventually("change applied", || h.get(|s| &s.levels) == 1).await;
+    assert_eq!(h.get(|s| &s.resyncs), 0);
+    assert_eq!(h.get(|s| &s.decode_errors), 0);
+    assert_eq!(h.get(|s| &s.ignored), 2);
+    h.finish().await;
+}
+
+#[tokio::test]
+async fn first_book_after_a_reconnect_is_compared_with_the_old_book() {
+    let changed = BOOK_A.replace("\"10\"", "\"99\"");
+    let (url, _log) = mock_server(move |n, mut ws, log| {
+        let changed = changed.clone();
+        async move {
+            next_text(&mut ws, &log, true).await;
+            if n == 0 {
+                send(&mut ws, BOOK_A).await;
+                return;
+            }
+            send(&mut ws, &changed).await;
+            idle(ws, log).await;
+        }
+    })
+    .await;
+    let h = start(fast_cfg(url), &["A"]);
+    eventually("second book", || h.get(|s| &s.books) == 2).await;
+    assert_eq!(h.get(|s| &s.gap_mismatched_books), 1);
+    assert_eq!(h.get(|s| &s.mismatched_books), 0, "a change during the gap is not a missed message");
     h.finish().await;
 }

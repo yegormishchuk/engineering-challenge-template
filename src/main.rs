@@ -17,7 +17,7 @@ use engineering_challenge::discovery::{self, Diff, Poll, PollerConfig, Tracker, 
 use engineering_challenge::exchange::Event;
 use engineering_challenge::shard::ShardManager;
 use engineering_challenge::writer::{self, Output};
-use engineering_challenge::ws::connection::ConnectionConfig;
+use engineering_challenge::ws::connection::{ConnectionConfig, VerifyConfig};
 
 #[derive(Parser, Debug)]
 #[command(about = "Records Polymarket order books in the challenge's SBE format")]
@@ -51,6 +51,10 @@ struct Args {
     /// Writer channel capacity, in messages.
     #[arg(long, default_value_t = 1 << 16)]
     channel_capacity: usize,
+
+    /// Do not check books assumed empty against the REST batch endpoint.
+    #[arg(long)]
+    no_verify_empty: bool,
 
     /// Seconds between counter logs.
     #[arg(long, default_value_t = 30)]
@@ -87,9 +91,19 @@ async fn main() -> anyhow::Result<()> {
     let (tick_tx, ticks) = watch::channel(chrono::Utc::now());
     tokio::spawn(clock::run_minute_ticks(tick_tx, shutdown.clone()));
 
+    // Every HTTP call has a deadline, so one stalled response cannot stop
+    // discovery or the empty-book checks for good.
+    let http = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(60))
+        .build()?;
+
     let (discovery_tx, mut discovery_rx) = mpsc::unbounded_channel::<Event>();
     let mut shards = ShardManager::new(
-        ConnectionConfig::default(),
+        ConnectionConfig {
+            verify: (!args.no_verify_empty).then(|| VerifyConfig::polymarket(http.clone())),
+            ..ConnectionConfig::default()
+        },
         args.max_per_connection,
         out,
         ticks,
@@ -103,7 +117,7 @@ async fn main() -> anyhow::Result<()> {
     });
     let (poll_tx, mut poll_rx) = mpsc::channel::<Poll>(64);
     let poller = tokio::spawn(discovery::run_poller(
-        reqwest::Client::new(),
+        http,
         PollerConfig {
             full_every: Duration::from_secs(args.full_every_mins * 60),
             recent_every: Duration::from_secs(args.recent_every_secs),
@@ -116,13 +130,13 @@ async fn main() -> anyhow::Result<()> {
 
     let mut stats_every = tokio::time::interval(Duration::from_secs(args.stats_every));
     stats_every.tick().await;
-    let mut failed = false;
+    let mut failed = None;
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
-            gone = shards.wait_for_failure() => {
-                error!(error = %gone, "writer stopped; shutting down");
-                failed = true;
+            failure = shards.wait_for_failure() => {
+                error!(error = %failure, "fatal; shutting down");
+                failed = Some(failure);
                 shutdown.cancel();
                 break;
             }
@@ -148,14 +162,16 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
+    // Closing the receiver ends any poller send still waiting for room.
+    drop(poll_rx);
     let _ = poller.await;
 
     log_stats(&shards);
     shards.join().await;
     let summary = writer.join()?;
     info!(?summary, "output flushed and closed");
-    if failed {
-        anyhow::bail!("collector stopped because the writer failed");
+    if let Some(failure) = failed {
+        anyhow::bail!("collector stopped: {failure}");
     }
     Ok(())
 }
@@ -195,6 +211,9 @@ fn log_stats(shards: &ShardManager) {
             resyncs = s.resyncs.load(Relaxed),
             minute_snapshots = s.minute_snapshots.load(Relaxed),
             assumed_empty = s.assumed_empty.load(Relaxed),
+            empty_confirmed = s.empty_confirmed.load(Relaxed),
+            empty_wrong = s.empty_wrong.load(Relaxed),
+            gap_mismatched_books = s.gap_mismatched_books.load(Relaxed),
             mb = s.bytes.load(Relaxed) / 1_000_000,
             busy_ms = s.busy_us.load(Relaxed) / 1000,
             max_frame_us = s.max_frame_us.load(Relaxed),

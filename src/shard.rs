@@ -17,6 +17,22 @@ use crate::exchange::Event;
 use crate::writer::{OutSender, WriterGone};
 use crate::ws::connection::{Command, ConnStats, Connection, ConnectionConfig};
 
+/// Why the collector cannot go on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Failure {
+    WriterGone,
+    Panicked(String),
+}
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WriterGone => f.write_str("writer thread has stopped"),
+            Self::Panicked(e) => write!(f, "connection task panicked: {e}"),
+        }
+    }
+}
+
 struct Slot {
     tx: mpsc::UnboundedSender<Command>,
     count: usize,
@@ -36,8 +52,11 @@ pub struct ShardManager {
 }
 
 impl ShardManager {
-    /// `discovery` receives `new_market` / `market_resolved` events from the
-    /// first connection only (the exchange broadcasts them to every socket).
+    /// `discovery` receives `new_market` / `market_resolved` events from
+    /// every connection. `new_market` is broadcast to every socket, so it
+    /// arrives once per connection; the tracker ignores the repeats.
+    /// `market_resolved` may go only to sockets subscribed to the market,
+    /// which is why no connection is singled out.
     pub fn new(
         cfg: ConnectionConfig,
         max_per_connection: usize,
@@ -114,14 +133,16 @@ impl ShardManager {
         removed
     }
 
-    /// Waits for the first connection to fail with [`WriterGone`]. Never
-    /// returns while all connections are healthy.
-    pub async fn wait_for_failure(&mut self) -> WriterGone {
+    /// Waits for a connection to fail: the writer is gone, or a task
+    /// panicked. A panicked connection's symbols would silently stop being
+    /// recorded, so it is treated as fatal too. Never returns while all
+    /// connections are healthy.
+    pub async fn wait_for_failure(&mut self) -> Failure {
         loop {
             match self.tasks.join_next().await {
-                Some(Ok(Err(gone))) => return gone,
+                Some(Ok(Err(WriterGone))) => return Failure::WriterGone,
                 Some(Ok(Ok(()))) => {}
-                Some(Err(e)) => tracing::error!(error = %e, "connection task panicked"),
+                Some(Err(e)) => return Failure::Panicked(e.to_string()),
                 None => std::future::pending::<()>().await,
             }
         }
@@ -156,8 +177,13 @@ impl ShardManager {
         let id = self.slots.len();
         let (tx, rx) = mpsc::unbounded_channel();
         let stats = Arc::new(ConnStats::default());
-        let discovery = if id == 0 { self.discovery.clone() } else { None };
-        let conn = Connection::new(id, self.cfg.clone(), self.out.clone(), Arc::clone(&stats), discovery);
+        let conn = Connection::new(
+            id,
+            self.cfg.clone(),
+            self.out.clone(),
+            Arc::clone(&stats),
+            self.discovery.clone(),
+        );
         self.tasks
             .spawn(conn.run(rx, self.ticks.clone(), self.shutdown.clone()));
         self.slots.push(Slot { tx, count: 0, stats });

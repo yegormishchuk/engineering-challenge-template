@@ -6,8 +6,14 @@
 //! | exchange snapshot | local receive time | snapshot time from the exchange |
 //! | level change | local receive time | change time from the exchange |
 //! | minute snapshot | emit time | last exchange time seen for the symbol |
+//!
+//! After a gap (reconnect or resync) a symbol's book is kept but marked
+//! **stale**: it is no baseline (changes are refused, minute snapshots skip
+//! it), but the next exchange book is still compared with it. That
+//! comparison is reported as `after_gap`, so offline validation, which
+//! replays across the gap, can be reconciled with the collector's counters.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use chrono::{DateTime, Utc};
@@ -42,11 +48,15 @@ pub struct SnapshotApplied {
     /// `None` for the first snapshot of a symbol; otherwise the levels where
     /// the local book differed from the exchange (empty = nothing missed).
     pub mismatches: Option<Vec<LevelMismatch>>,
+    /// The book compared against was stale (from before a gap), so a
+    /// mismatch is expected change during the gap, not a missed message.
+    pub after_gap: bool,
 }
 
 #[derive(Debug, Default)]
 pub struct Books {
     books: HashMap<String, OrderBook>,
+    stale: HashSet<String>,
 }
 
 impl Books {
@@ -66,12 +76,25 @@ impl Books {
         self.books.get(symbol)
     }
 
-    pub fn contains(&self, symbol: &str) -> bool {
-        self.books.contains_key(symbol)
+    /// Whether the symbol has a book that changes can be applied to.
+    pub fn has_baseline(&self, symbol: &str) -> bool {
+        self.books.contains_key(symbol) && !self.stale.contains(symbol)
+    }
+
+    /// Keeps the book for comparison but stops treating it as a baseline.
+    pub fn mark_stale(&mut self, symbol: &str) {
+        if self.books.contains_key(symbol) {
+            self.stale.insert(symbol.to_owned());
+        }
+    }
+
+    pub fn mark_all_stale(&mut self) {
+        self.stale = self.books.keys().cloned().collect();
     }
 
     /// Drops a symbol, e.g. after unsubscribing. Returns whether it existed.
     pub fn remove(&mut self, symbol: &str) -> bool {
+        self.stale.remove(symbol);
         self.books.remove(symbol).is_some()
     }
 
@@ -101,10 +124,12 @@ impl Books {
                 None
             }
         };
+        let after_gap = self.stale.remove(symbol);
         let book = &self.books[symbol];
         Ok(SnapshotApplied {
             msg: OutMsg::Snapshot(book.snapshot(symbol, received_at, exchange_ts)),
             mismatches,
+            after_gap,
         })
     }
 
@@ -119,9 +144,13 @@ impl Books {
         exchange_ts: DateTime<Utc>,
         received_at: DateTime<Utc>,
     ) -> Result<OutMsg, BooksError> {
-        let book = self.books.get_mut(symbol).ok_or_else(|| BooksError::NoBaseline {
+        let no_baseline = || BooksError::NoBaseline {
             symbol: symbol.to_owned(),
-        })?;
+        };
+        if self.stale.contains(symbol) {
+            return Err(no_baseline());
+        }
+        let book = self.books.get_mut(symbol).ok_or_else(no_baseline)?;
         book.set_level(side, price, quantity, exchange_ts)
             .map_err(|error| BooksError::Book {
                 symbol: symbol.to_owned(),
@@ -137,10 +166,14 @@ impl Books {
         )))
     }
 
-    /// One `Snapshot` per symbol, for the minute timer, sorted by symbol so
-    /// the output order is deterministic.
+    /// One `Snapshot` per symbol with a baseline, for the minute timer, sorted
+    /// by symbol so the output order is deterministic.
     pub fn minute_snapshots(&self, emitted_at: DateTime<Utc>) -> Vec<OutMsg> {
-        let mut symbols: Vec<&String> = self.books.keys().collect();
+        let mut symbols: Vec<&String> = self
+            .books
+            .keys()
+            .filter(|s| !self.stale.contains(*s))
+            .collect();
         symbols.sort_unstable();
         symbols
             .into_iter()
@@ -236,6 +269,38 @@ mod tests {
             })
             .collect();
         assert_eq!(summary, [("A", ts(60_000), ts(9)), ("B", ts(60_000), ts(5))]);
+    }
+
+    #[test]
+    fn stale_book_is_no_baseline_but_is_compared_with_the_next_book() {
+        let mut books = Books::new();
+        books.apply_snapshot("T", [(100, 1)], [], ts(1), ts(1)).unwrap();
+        books.apply_snapshot("U", [(100, 1)], [], ts(1), ts(1)).unwrap();
+        books.mark_all_stale();
+        assert!(!books.has_baseline("T"));
+        assert!(matches!(
+            books.apply_level("T", Side::Buy, 100, 2, ts(2), ts(2)),
+            Err(BooksError::NoBaseline { .. })
+        ));
+        assert!(books.minute_snapshots(ts(3)).is_empty(), "stale books are not snapshotted");
+
+        let same = books.apply_snapshot("T", [(100, 1)], [], ts(4), ts(4)).unwrap();
+        assert_eq!((same.mismatches, same.after_gap), (Some(vec![]), true));
+        let changed = books.apply_snapshot("U", [(100, 5)], [], ts(4), ts(4)).unwrap();
+        assert!(changed.after_gap);
+        assert_eq!(changed.mismatches.unwrap().len(), 1);
+        assert!(books.has_baseline("T") && books.has_baseline("U"));
+        let live = books.apply_snapshot("T", [(100, 1)], [], ts(5), ts(5)).unwrap();
+        assert!(!live.after_gap, "only the first book after the gap");
+        assert_eq!(books.minute_snapshots(ts(6)).len(), 2);
+    }
+
+    #[test]
+    fn mark_stale_on_an_unknown_symbol_does_nothing() {
+        let mut books = Books::new();
+        books.mark_stale("nope");
+        let first = books.apply_snapshot("nope", [], [], ts(1), ts(1)).unwrap();
+        assert_eq!((first.mismatches, first.after_gap), (None, false));
     }
 
     #[test]

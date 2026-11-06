@@ -1,9 +1,16 @@
 //! The single writer thread that owns the template's [`AlignedSbeWriter`].
 //!
-//! Producers (connection tasks) send [`OutMsg`]s through a bounded channel.
-//! The writer thread drains it in order and flushes once every sender is
-//! gone, which is how shutdown reaches it: drop all [`OutSender`]s, then call
+//! Producers (connection tasks) send [`OutMsg`]s through a bounded tokio
+//! channel: [`OutSender::send`] awaits when the channel is full, so
+//! backpressure suspends only the sending task and never blocks a runtime
+//! worker thread (other connections keep reading their sockets). The writer
+//! thread drains the channel in order and flushes once every sender is gone,
+//! which is how shutdown reaches it: drop all [`OutSender`]s, then call
 //! [`WriterHandle::join`].
+//!
+//! A message that cannot be encoded (for example a timestamp before 1970) is
+//! skipped and counted; it never costs the rest of the buffered chunk. An I/O
+//! error is fatal: the writer still tries to flush what it holds, then stops.
 //!
 //! The writer never flushes on a timer: every `flush()` pads the chunk to the
 //! full 64 MiB, so periodic flushes would mostly write zeros (see the spec,
@@ -15,7 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::JoinHandle;
 
 use anyhow::Context;
-use crossbeam::channel::{self, Receiver, Sender, TrySendError};
+use tokio::sync::mpsc::{self, Receiver, Sender, error::TrySendError};
 
 use crate::util::AlignedSbeWriter;
 use crate::util::dtos::challenge_orderbook::{PriceLevelUpdateDomain, SnapshotDomain};
@@ -63,6 +70,8 @@ pub struct WriterStats {
     pub updates: AtomicU64,
     /// Sends that found the channel full and had to wait.
     pub backpressure: AtomicU64,
+    /// Messages skipped because they could not be encoded.
+    pub encode_errors: AtomicU64,
 }
 
 /// The writer thread has stopped (it failed, or shutdown is under way).
@@ -86,19 +95,35 @@ pub struct OutSender {
 
 impl OutSender {
     /// Queues a message, never dropping it. If the channel is full this
-    /// counts and logs the backpressure, then blocks the calling thread until
-    /// there is room.
-    pub fn send(&self, msg: OutMsg) -> Result<(), WriterGone> {
+    /// counts and logs the backpressure, then waits for room.
+    pub async fn send(&self, msg: OutMsg) -> Result<(), WriterGone> {
         match self.tx.try_send(msg) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(msg)) => {
-                let n = self.stats.backpressure.fetch_add(1, Ordering::Relaxed) + 1;
-                if n.is_power_of_two() {
-                    tracing::warn!(count = n, "writer channel full; producer is blocking");
-                }
-                self.tx.send(msg).map_err(|_| WriterGone)
+                self.note_backpressure();
+                self.tx.send(msg).await.map_err(|_| WriterGone)
             }
-            Err(TrySendError::Disconnected(_)) => Err(WriterGone),
+            Err(TrySendError::Closed(_)) => Err(WriterGone),
+        }
+    }
+
+    /// [`Self::send`] for plain threads. Panics if called inside an async
+    /// context; use `send` there.
+    pub fn send_blocking(&self, msg: OutMsg) -> Result<(), WriterGone> {
+        match self.tx.try_send(msg) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(msg)) => {
+                self.note_backpressure();
+                self.tx.blocking_send(msg).map_err(|_| WriterGone)
+            }
+            Err(TrySendError::Closed(_)) => Err(WriterGone),
+        }
+    }
+
+    fn note_backpressure(&self) {
+        let n = self.stats.backpressure.fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_power_of_two() {
+            tracing::warn!(count = n, "writer channel full; producer is waiting");
         }
     }
 
@@ -112,6 +137,7 @@ pub struct WriterSummary {
     pub snapshots: u64,
     pub updates: u64,
     pub backpressure: u64,
+    pub encode_errors: u64,
 }
 
 pub struct WriterHandle {
@@ -130,6 +156,7 @@ impl WriterHandle {
             snapshots: self.stats.snapshots.load(Ordering::Relaxed),
             updates: self.stats.updates.load(Ordering::Relaxed),
             backpressure: self.stats.backpressure.load(Ordering::Relaxed),
+            encode_errors: self.stats.encode_errors.load(Ordering::Relaxed),
         })
     }
 }
@@ -148,7 +175,7 @@ fn spawn_with_chunk(
     let path = output.path().to_owned();
     let writer = AlignedSbeWriter::create(&path, chunk)
         .with_context(|| format!("opening output {}", path.display()))?;
-    let (tx, rx) = channel::bounded(capacity);
+    let (tx, rx) = mpsc::channel(capacity);
     let stats = Arc::new(WriterStats::default());
     let thread_stats = Arc::clone(&stats);
     let thread = std::thread::Builder::new()
@@ -158,17 +185,31 @@ fn spawn_with_chunk(
     Ok((OutSender { tx, stats: Arc::clone(&stats) }, WriterHandle { thread, stats }))
 }
 
-fn run(mut writer: AlignedSbeWriter, rx: Receiver<OutMsg>, stats: &WriterStats) -> anyhow::Result<()> {
-    // `iter()` ends when every sender is dropped and the queue is empty.
-    for msg in rx.iter() {
-        match &msg {
-            OutMsg::Snapshot(s) => {
-                writer.write_msg(s).context("writing snapshot")?;
-                stats.snapshots.fetch_add(1, Ordering::Relaxed);
+fn run(mut writer: AlignedSbeWriter, mut rx: Receiver<OutMsg>, stats: &WriterStats) -> anyhow::Result<()> {
+    // `blocking_recv` returns `None` once every sender is dropped and the
+    // queue is empty.
+    while let Some(msg) = rx.blocking_recv() {
+        let (result, counter) = match &msg {
+            OutMsg::Snapshot(s) => (writer.write_msg(s), &stats.snapshots),
+            OutMsg::Update(u) => (writer.write_msg(u), &stats.updates),
+        };
+        match result {
+            Ok(()) => {
+                counter.fetch_add(1, Ordering::Relaxed);
             }
-            OutMsg::Update(u) => {
-                writer.write_msg(u).context("writing update")?;
-                stats.updates.fetch_add(1, Ordering::Relaxed);
+            Err(error) if error.downcast_ref::<std::io::Error>().is_some() => {
+                // Disk or pipe failure. Keep what can still be kept.
+                if let Err(flush) = writer.flush() {
+                    tracing::error!(error = %flush, "flush after a write error also failed");
+                }
+                return Err(error.context("writing output"));
+            }
+            Err(error) => {
+                // The message could not be encoded; the buffer is unchanged.
+                let n = stats.encode_errors.fetch_add(1, Ordering::Relaxed) + 1;
+                if n.is_power_of_two() {
+                    tracing::error!(%error, count = n, message = ?msg, "skipping a message that cannot be encoded");
+                }
             }
         }
     }
@@ -236,10 +277,10 @@ mod tests {
             .map(|symbol| {
                 let tx = tx.clone();
                 std::thread::spawn(move || {
-                    tx.send(OutMsg::Snapshot(snapshot(symbol))).unwrap();
+                    tx.send_blocking(OutMsg::Snapshot(snapshot(symbol))).unwrap();
                     for i in 0..100 {
                         let u = level_update(symbol, Side::Buy, 500_000, i, ts(10 + i), ts(10 + i));
-                        tx.send(OutMsg::Update(u)).unwrap();
+                        tx.send_blocking(OutMsg::Update(u)).unwrap();
                     }
                 })
             })
@@ -273,7 +314,7 @@ mod tests {
         // Capacity 1 with a fast producer forces the full-channel path.
         let (tx, handle) = spawn(&output, 1).unwrap();
         for i in 0..2_000 {
-            tx.send(OutMsg::Update(level_update("A", Side::Sell, 1, i, ts(i), ts(i))))
+            tx.send_blocking(OutMsg::Update(level_update("A", Side::Sell, 1, i, ts(i), ts(i))))
                 .unwrap();
         }
         drop(tx);
@@ -294,7 +335,7 @@ mod tests {
         let n = (CHUNK_SIZE as i64 / len) * 3 / 2;
         let (tx, handle) = spawn(&output, 1 << 16).unwrap();
         for i in 0..n {
-            tx.send(OutMsg::Update(level_update("SYM", Side::Buy, 1, i, ts(i), ts(i))))
+            tx.send_blocking(OutMsg::Update(level_update("SYM", Side::Buy, 1, i, ts(i), ts(i))))
                 .unwrap();
         }
         drop(tx);
@@ -311,23 +352,61 @@ mod tests {
     }
 
     #[test]
-    fn send_after_writer_failure_reports_writer_gone() {
-        let dir = tempfile::tempdir().unwrap();
-        let output = Output::File(dir.path().join("out.sbe"));
-        // A chunk too small for any message makes the first write fail.
-        let (tx, handle) = spawn_with_chunk(&output, 1, 16).unwrap();
-        let msg = || OutMsg::Snapshot(snapshot("A"));
+    fn io_error_stops_the_writer_and_senders_see_writer_gone() {
+        // Writes to /dev/full fail with ENOSPC; a small chunk makes the first
+        // chunk write happen quickly.
+        let output = Output::File("/dev/full".into());
+        let (tx, handle) = spawn_with_chunk(&output, 1, 256).unwrap();
         let mut result = Ok(());
-        for _ in 0..100 {
-            result = tx.send(msg());
+        for i in 0..10_000 {
+            result = tx.send_blocking(OutMsg::Update(level_update("A", Side::Buy, 1, i, ts(i), ts(i))));
             if result.is_err() {
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(1));
         }
         assert_eq!(result, Err(WriterGone));
         drop(tx);
-        assert!(handle.join().is_err());
+        let err = handle.join().unwrap_err();
+        assert!(format!("{err:#}").contains("writing output"), "{err:#}");
+    }
+
+    #[test]
+    fn unencodable_message_is_skipped_and_the_rest_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = Output::File(dir.path().join("out.sbe"));
+        let (tx, handle) = spawn(&output, 16).unwrap();
+        tx.send_blocking(OutMsg::Snapshot(snapshot("A"))).unwrap();
+        // Before 1970: the schema stores unsigned microseconds.
+        let bad = level_update("A", Side::Buy, 1, 1, ts(-5), ts(-5));
+        tx.send_blocking(OutMsg::Update(bad)).unwrap();
+        tx.send_blocking(OutMsg::Update(level_update("A", Side::Buy, 1, 2, ts(7), ts(7))))
+            .unwrap();
+        drop(tx);
+        let summary = handle.join().unwrap();
+        assert_eq!((summary.snapshots, summary.updates, summary.encode_errors), (1, 1, 1));
+        assert_eq!(read_all(output.path()).len(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn async_send_waits_without_blocking_the_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = Output::File(dir.path().join("out.sbe"));
+        let (tx, handle) = spawn(&output, 1).unwrap();
+        // With one worker thread, a blocking send would starve this task.
+        let ticker = tokio::spawn(async {
+            for _ in 0..20 {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        });
+        for i in 0..5_000 {
+            tx.send(OutMsg::Update(level_update("A", Side::Buy, 1, i, ts(i), ts(i))))
+                .await
+                .unwrap();
+        }
+        ticker.await.unwrap();
+        drop(tx);
+        let summary = tokio::task::spawn_blocking(move || handle.join()).await.unwrap().unwrap();
+        assert_eq!(summary.updates, 5_000);
     }
 
     #[test]
