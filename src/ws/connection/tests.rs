@@ -1319,3 +1319,10 @@ async fn a_slow_reader_is_not_taken_for_a_lost_message() {
     assert_eq!((h.switches(), h.get(0, |s| &s.resyncs)), (0, 0));
     h.finish().await;
 }
+
+#[test]
+fn stamps_do_not_go_back_with_the_clock() {
+    let t = |ms| chrono::DateTime::<Utc>::from_timestamp_millis(ms).unwrap();
+    assert_eq!(monotonic(t(1000), t(900)), t(1000));
+    assert_eq!(monotonic(t(614), t(1000)), t(1000), "a 386 ms step back is held");
+}

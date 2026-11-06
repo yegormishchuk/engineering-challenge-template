@@ -69,10 +69,9 @@ struct Args {
     verify_rate: f64,
 
     /// Connections per shard, all subscribed to the same symbols; one writes
-    /// at a time and the others take over when it fails (1 = no redundancy).
-    /// Default 1 until hash-based loss detection stops misfiring live (see
-    /// docs/NEXT.md, E1 status).
-    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..=4))]
+    /// at a time and the others take over when it fails, lags or loses data
+    /// (1 = no redundancy). Each extra member about doubles memory.
+    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u64).range(1..=4))]
     redundancy: u64,
 
     /// Seconds between counter logs.
@@ -247,6 +246,8 @@ fn log_stats(shards: &ShardManager) {
             gap_mismatched_books = s.gap_mismatched_books.load(Relaxed),
             switch_snapshots = s.switch_snapshots.load(Relaxed),
             switch_without_baseline = s.switch_without_baseline.load(Relaxed),
+            lock_wait_ms = s.lock_wait_us.load(Relaxed) / 1000,
+            max_lock_wait_us = s.max_lock_wait_us.load(Relaxed),
             mb = s.bytes.load(Relaxed) / 1_000_000,
             busy_ms = s.busy_us.load(Relaxed) / 1000,
             max_frame_us = s.max_frame_us.load(Relaxed),

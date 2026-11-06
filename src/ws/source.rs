@@ -47,16 +47,22 @@ pub struct DetectConfig {
     pub hold: Duration,
 }
 
+/// Measured live (2026-11-06, two sockets on the same 6000 tokens, after
+/// the subscribe bursts): every hash reached both sockets, but the same
+/// change arrived up to 4.0 s apart (p50 141 ms, p90 2.9 s, p99 3.8 s); in
+/// collector runs one socket stayed ~4 s behind and changes came up to 16 s
+/// late. A `PONG` can overtake queued changes, so only time tells late from
+/// lost: a loss is declared after 30 s, and lag must be sustained.
 impl Default for DetectConfig {
     fn default() -> Self {
         Self {
-            loss_after: Duration::from_secs(2),
-            keep: Duration::from_secs(5),
+            loss_after: Duration::from_secs(30),
+            keep: Duration::from_secs(35),
             lag_window: Duration::from_secs(30),
-            lag_threshold: Duration::from_millis(200),
-            min_lag_samples: 20,
+            lag_threshold: Duration::from_millis(250),
+            min_lag_samples: 100,
             max_lag_samples: 2000,
-            hold: Duration::from_secs(10),
+            hold: Duration::from_secs(60),
         }
     }
 }
@@ -409,6 +415,8 @@ mod tests {
 
     fn fast() -> DetectConfig {
         DetectConfig {
+            loss_after: Duration::from_secs(2),
+            keep: Duration::from_secs(5),
             min_lag_samples: 3,
             hold: Duration::ZERO,
             ..DetectConfig::default()

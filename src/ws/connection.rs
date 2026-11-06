@@ -231,6 +231,9 @@ pub struct ConnStats {
     /// Symbols without a live book when this connection became the source:
     /// nothing is written for them until their next book.
     pub switch_without_baseline: AtomicU64,
+    /// Time spent waiting for the shard's output lock, total and longest, µs.
+    pub lock_wait_us: AtomicU64,
+    pub max_lock_wait_us: AtomicU64,
 }
 
 fn inc(counter: &AtomicU64) {
@@ -245,6 +248,11 @@ fn add(counter: &AtomicU64, n: usize) {
 struct Verified {
     checked: Vec<String>,
     result: Result<HashMap<String, polymarket::RestBook>, String>,
+}
+
+/// `now`, or `last` if the clock went back.
+fn monotonic(now: DateTime<Utc>, last: DateTime<Utc>) -> DateTime<Utc> {
+    now.max(last)
 }
 
 /// Levels as `(side is bid, price, quantity)`, for comparing books.
@@ -272,6 +280,8 @@ pub struct Connection {
     seen_epoch: u64,
     /// Receive instant of the frame being handled, for hash tracking.
     frame_at: std::time::Instant,
+    /// The latest output timestamp taken; see [`Self::stamp`].
+    last_stamp: DateTime<Utc>,
     cfg: ConnectionConfig,
     /// In the order they were added, so a market's tokens (added together)
     /// stay in the same subscription batch after a reconnect.
@@ -360,6 +370,7 @@ impl Connection {
             member: None,
             seen_epoch: 0,
             frame_at: std::time::Instant::now(),
+            last_stamp: DateTime::<Utc>::MIN_UTC,
             cfg,
             symbols: IndexSet::new(),
             books: Books::new(),
@@ -387,6 +398,15 @@ impl Connection {
         }
     }
 
+    /// The wall-clock time for output, never earlier than the previous one
+    /// taken on this connection. The host clock can step back (WSL2 resyncs
+    /// with Windows: a 386 ms step was seen live), and a symbol's receive
+    /// times must not go backwards.
+    fn stamp(&mut self) -> DateTime<Utc> {
+        self.last_stamp = monotonic(Utc::now(), self.last_stamp);
+        self.last_stamp
+    }
+
     /// Makes this connection one of a shard's redundant members.
     pub fn with_member(mut self, member: Member) -> Self {
         self.member = Some(member);
@@ -408,7 +428,11 @@ impl Connection {
             return Ok(Some(None));
         };
         let (shard, me) = (Arc::clone(&member.shard), member.index);
+        let waiting = std::time::Instant::now();
         let mut st = shard.lock_owned().await;
+        let us = waiting.elapsed().as_micros() as u64;
+        self.stats.lock_wait_us.fetch_add(us, Ordering::Relaxed);
+        self.stats.max_lock_wait_us.fetch_max(us, Ordering::Relaxed);
         if !shard.take_over_if_source_down(&mut st, me) {
             return Ok(None);
         }
@@ -668,7 +692,7 @@ impl Connection {
                 }
                 frame = ws.next() => {
                     // Stamp first, before any parsing.
-                    let received_at = Utc::now();
+                    let received_at = self.stamp();
                     let text = match frame {
                         None => return Ok(SessionEnd::Lost("stream ended".into())),
                         Some(Err(e)) => return Ok(SessionEnd::Lost(e.to_string())),
@@ -775,7 +799,7 @@ impl Connection {
                         self.ticks_open = false;
                         continue;
                     }
-                    let emitted_at = Utc::now();
+                    let emitted_at = self.stamp();
                     if let Some(mut guard) = self.begin_output(emitted_at).await? {
                         for msg in self.books.minute_snapshots(emitted_at) {
                             self.write(guard.as_deref_mut(), msg).await?;
@@ -1053,7 +1077,8 @@ impl Connection {
             .collect();
         overdue.sort_unstable();
         for symbol in overdue {
-            self.assume_empty(&symbol, Utc::now()).await?;
+            let at = self.stamp();
+            self.assume_empty(&symbol, at).await?;
         }
         Ok(())
     }
