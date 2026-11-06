@@ -7,8 +7,11 @@
 # cannot touch a running binary), starts the collector directly, samples its
 # memory every 30 s, sends SIGINT after <secs>, then validates the output.
 #
+# Output: $RUN_SBE_DIR/<name>.sbe (default /mnt/d/runs, unless the collector
+# args give --output). Not in ~/runs: the WSL virtual disk lives on C: and
+# never shrinks; ~3 GB per full-scale run filled C: on 2026-11-06.
+#
 # Files in ~/runs/:
-#   <name>.sbe       output (unless the collector args give --output)
 #   <name>.log       collector stderr
 #   <name>.mem       samples: utc elapsed_s vmrss_kb vmhwm_kb memavailable_kb
 #   <name>.info      commit, args, start/end, exit code, output size
@@ -41,7 +44,7 @@ mem=$runs/$name.mem
 info=$runs/$name.info
 report=$runs/$name.validate
 
-# Output: the collector's --output if given, else ~/runs/<name>.sbe. It is
+# Output: the collector's --output if given, else $RUN_SBE_DIR/<name>.sbe. It is
 # taken out of the args and passed back as an absolute path, so the check
 # below, the collector (run from the repo) and validate all see one file.
 out=
@@ -53,7 +56,9 @@ for ((i = 0; i < ${#args[@]}; i++)); do
         *) rest+=("${args[i]}") ;;
     esac
 done
-[[ -n $out ]] || out=$runs/$name.sbe
+sbe_dir=${RUN_SBE_DIR:-/mnt/d/runs}
+mkdir -p "$sbe_dir"
+[[ -n $out ]] || out=$sbe_dir/$name.sbe
 case $out in -|/dev/stdout) echo "run.sh needs a file output, not stdout" >&2; exit 2 ;; esac
 out=${out/#\~/$HOME}
 [[ $out == /* ]] || out=$PWD/$out

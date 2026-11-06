@@ -84,8 +84,10 @@ existing file would overwrite it. Use a new file for every run.
 
 `scripts/run.sh <name> --duration <secs> [-- <args>]` is a wrapper for
 measured runs: it copies the binary, runs it with output
-`~/runs/<name>.sbe`, samples memory every 30 s, stops it with SIGINT, and
-validates. `scripts/summarize.py ~/runs/<name>.log` summarizes the log.
+`$RUN_SBE_DIR/<name>.sbe` (default `/mnt/d/runs`: under WSL, files in the
+Linux home grow a virtual disk on C: that never shrinks), samples memory
+every 30 s, stops it with SIGINT, and validates. Logs stay in `~/runs/`;
+`scripts/summarize.py ~/runs/<name>.log` summarizes one.
 
 ### Flags
 
