@@ -212,7 +212,7 @@ Counters are totals since start.
 | `switch_snapshots`, `switch_without_baseline` | snapshots this connection wrote on becoming its shard's source; symbols it had no live book for then (nothing is written for them until their next book) |
 | `lock_wait_ms`, `max_lock_wait_us` | time waiting for the shard's output lock, total and longest |
 | `silent_resyncs` | active tokens resubscribed because they went quiet (see Subscription monitoring) |
-| `active_symbols` | tokens counted as active at the last silence check (gauge) |
+| `active_symbols` | tokens counted as active (changed in ≥ 45 of 50 minutes) at the last silence check (gauge) |
 | `recycles`, `recycles_skipped` | planned reconnects done (not counted in `disconnects`); ones skipped because the source had no peer with its books ready |
 
 With `--redundancy` above 1, a `shard source` line per shard follows:
@@ -329,17 +329,20 @@ An exchange can stop sending a subscription without saying so, or slow down
 a socket it has been serving for hours. Two mechanisms handle that, at every
 `--redundancy`:
 
-- **Quiet tokens.** Each connection tracks, per token, a moving average of
-  the time between frames that change its book (several entries of one
-  frame count once). A token is *active* after 10 such frames with an
-  average gap under 60 s. Every 5 s, an active token that has had nothing
-  for max(5 × its average gap, 60 s) is resubscribed (unsubscribe, fresh
-  book, compared with the old one), at most 100 per connection per check.
-  A market that really stopped trading drops out by itself: each resync's
-  book adds the long gap to the average, and after a few rounds the token
-  is no longer active. With redundancy, the hash check (Redundancy) usually
-  catches a token silent on one socket first; this check also covers a
-  token silent on every socket.
+- **Quiet tokens.** Each connection records, per token, which of the last
+  64 minutes had a change (a 64-bit mask). Polymarket markets change in
+  bursts (many changes within milliseconds, then minutes of nothing), so
+  gaps between changes say little: a first version based on them
+  resynced 190k times in 30 minutes. A token is *active* if it changed in
+  at least 45 of the 50 minutes before the last 10; an active token with
+  no change in the last 10 minutes is resubscribed (unsubscribe, fresh
+  book, compared with the old one), at most 100 per connection per 5 s
+  check. The fresh book (or empty guess) counts as a change, and the 10
+  empty minutes keep a market that really stopped below "active", so it is
+  resubscribed once. Nothing is active in the first hour after start.
+  With redundancy, the hash check (Redundancy) catches a token silent on
+  one socket much sooner; this check also covers a token silent on every
+  socket.
 - **Recycling.** Every connection is reconnected once per
   `--recycle-hours` (default 6), one at a time, spread evenly over the
   period. The next one waits until the previous one is back with books for

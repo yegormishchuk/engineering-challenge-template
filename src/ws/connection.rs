@@ -974,7 +974,7 @@ impl Connection {
                 match self.books.apply_snapshot(&symbol, bids, asks, exchange_ts, received_at) {
                     Ok(applied) => {
                         inc(&self.stats.books);
-                        self.books.note_activity(&symbol, self.frame_at);
+                        self.books.note_activity(&symbol, self.frame_at, &self.cfg.silence);
                         if subscribed {
                             if let (Some(m), Some(hash)) = (&self.member, hash.as_deref()) {
                                 m.shard.observe_existing(m.index, hash, self.frame_at);
@@ -1024,7 +1024,7 @@ impl Connection {
                 match self.books.apply_level(&symbol, side, price, quantity, exchange_ts, received_at) {
                     Ok(msg) => {
                         inc(&self.stats.levels);
-                        self.books.note_activity(&symbol, self.frame_at);
+                        self.books.note_activity(&symbol, self.frame_at, &self.cfg.silence);
                         self.observe(&symbol, hash.as_deref(), true);
                         self.emit(msg).await?;
                     }
@@ -1191,7 +1191,7 @@ impl Connection {
         // Like an exchange book: restarts the symbol's silence clock (a
         // market resynced for silence that has no orders gets this instead
         // of a book, and would otherwise look silent again at once).
-        self.books.note_activity(symbol, std::time::Instant::now());
+        self.books.note_activity(symbol, std::time::Instant::now(), &self.cfg.silence);
         self.assumed.insert(symbol.to_owned());
         self.note_mismatches(symbol, &applied);
         if self.cfg.verify.is_some() && !self.gave_up.contains(symbol) {

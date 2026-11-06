@@ -42,25 +42,35 @@ fn fast_cfg(url: String) -> ConnectionConfig {
         shard_check_every: Duration::from_millis(20),
         // Off unless a test turns it on (see `silence_cfg`).
         silence: crate::books::SilenceConfig {
-            min_changes: u32::MAX,
+            min_active: u32::MAX,
             ..Default::default()
         },
     }
 }
 
-/// `fast_cfg` with silence detection on: active after 3 events with a
-/// mean gap under 1 s; silent after max(5 x mean, 300 ms).
+/// `fast_cfg` with silence detection on, in 50 ms buckets: active if 8 of
+/// 10 buckets had a change; silent after 4 empty buckets (~200 ms).
 fn silence_cfg(url: String) -> ConnectionConfig {
     ConnectionConfig {
         silence: crate::books::SilenceConfig {
-            check_every: Duration::from_millis(50),
-            min_changes: 3,
-            active_below: Duration::from_secs(1),
-            factor: 5.0,
-            min_silence: Duration::from_millis(300),
+            check_every: Duration::from_millis(20),
+            bucket: Duration::from_millis(50),
+            quiet: 4,
+            history: 10,
+            min_active: 8,
             max_per_check: 100,
         },
         ..fast_cfg(url)
+    }
+}
+
+/// `BOOK_A`, then a change for A every 25 ms for 700 ms (every bucket of
+/// `silence_cfg` has one), then nothing more for A.
+async fn busy_then_quiet(ws: &mut ServerWs) {
+    send(ws, BOOK_A).await;
+    for i in 0..28 {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        send(ws, &change_a(&(16 + i).to_string(), 1793822781010 + i)).await;
     }
 }
 
@@ -1354,18 +1364,14 @@ fn stamps_do_not_go_back_with_the_clock() {
 async fn a_silent_symbol_is_resubscribed() {
     let (url, log) = mock_server(|_, mut ws, log| async move {
         next_text(&mut ws, &log, true).await;
-        send(&mut ws, BOOK_A).await;
-        for i in 0..6 {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            send(&mut ws, &change_a(&(16 + i).to_string(), 1793822781010 + i)).await;
-        }
+        busy_then_quiet(&mut ws).await;
         // A goes quiet; the resubscription gets no book either.
         idle(ws, log).await;
     })
     .await;
     let h = start(silence_cfg(url), &["A"]);
     eventually("A resubscribed", || h.get(|s| &s.silent_resyncs) == 1).await;
-    assert_eq!(h.get(|s| &s.levels), 6);
+    assert_eq!(h.get(|s| &s.levels), 28);
     eventually("unsubscribe sent", || {
         log.lock().unwrap().iter().any(|m| m.contains("\"operation\":\"unsubscribe\"") && m.contains("\"A\""))
     })
@@ -1386,11 +1392,7 @@ async fn an_empty_guess_after_a_silent_resync_restarts_the_silence_clock() {
     // it is resynced every check, forever.
     let (url, _log) = mock_server(|_, mut ws, log| async move {
         next_text(&mut ws, &log, true).await;
-        send(&mut ws, BOOK_A).await;
-        for i in 0..6 {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            send(&mut ws, &change_a(&(16 + i).to_string(), 1793822781010 + i)).await;
-        }
+        busy_then_quiet(&mut ws).await;
         idle(ws, log).await;
     })
     .await;
@@ -1402,8 +1404,9 @@ async fn an_empty_guess_after_a_silent_resync_restarts_the_silence_clock() {
         &["A"],
     );
     eventually("empty guess after the resync", || h.get(|s| &s.assumed_empty) == 1).await;
-    // min_silence is 300 ms; checks run every 50 ms.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // The guess counts as activity, and the empty buckets before it keep
+    // the symbol below "active": it is never flagged again.
+    tokio::time::sleep(Duration::from_secs(1)).await;
     assert_eq!(h.get(|s| &s.silent_resyncs), 1);
     h.finish().await;
 }
