@@ -167,22 +167,21 @@ impl Books {
     }
 
     /// One `Snapshot` per symbol with a baseline, for the minute timer, sorted
-    /// by symbol so the output order is deterministic.
-    pub fn minute_snapshots(&self, emitted_at: DateTime<Utc>) -> Vec<OutMsg> {
+    /// by symbol so the output order is deterministic. Built one at a time as
+    /// the caller sends them: all connections snapshot at the same instant,
+    /// and holding every snapshot at once cost ~430 bytes per symbol.
+    pub fn minute_snapshots(&self, emitted_at: DateTime<Utc>) -> impl Iterator<Item = OutMsg> + '_ {
         let mut symbols: Vec<&String> = self
             .books
             .keys()
             .filter(|s| !self.stale.contains(*s))
             .collect();
         symbols.sort_unstable();
-        symbols
-            .into_iter()
-            .map(|symbol| {
-                let book = &self.books[symbol];
-                let exchange_ts = book.last_exchange_ts().unwrap_or(emitted_at);
-                OutMsg::Snapshot(book.snapshot(symbol, emitted_at, exchange_ts))
-            })
-            .collect()
+        symbols.into_iter().map(move |symbol| {
+            let book = &self.books[symbol];
+            let exchange_ts = book.last_exchange_ts().unwrap_or(emitted_at);
+            OutMsg::Snapshot(book.snapshot(symbol, emitted_at, exchange_ts))
+        })
     }
 }
 
@@ -260,7 +259,7 @@ mod tests {
         books.apply_snapshot("A", [], [(2, 2)], ts(7), ts(8)).unwrap();
         books.apply_level("A", Side::Sell, 2, 3, ts(9), ts(10)).unwrap();
 
-        let snaps = books.minute_snapshots(ts(60_000));
+        let snaps: Vec<OutMsg> = books.minute_snapshots(ts(60_000)).collect();
         let summary: Vec<_> = snaps
             .iter()
             .map(|m| match m {
@@ -282,7 +281,7 @@ mod tests {
             books.apply_level("T", Side::Buy, 100, 2, ts(2), ts(2)),
             Err(BooksError::NoBaseline { .. })
         ));
-        assert!(books.minute_snapshots(ts(3)).is_empty(), "stale books are not snapshotted");
+        assert!(books.minute_snapshots(ts(3)).next().is_none(), "stale books are not snapshotted");
 
         let same = books.apply_snapshot("T", [(100, 1)], [], ts(4), ts(4)).unwrap();
         assert_eq!((same.mismatches, same.after_gap), (Some(vec![]), true));
@@ -292,7 +291,7 @@ mod tests {
         assert!(books.has_baseline("T") && books.has_baseline("U"));
         let live = books.apply_snapshot("T", [(100, 1)], [], ts(5), ts(5)).unwrap();
         assert!(!live.after_gap, "only the first book after the gap");
-        assert_eq!(books.minute_snapshots(ts(6)).len(), 2);
+        assert_eq!(books.minute_snapshots(ts(6)).count(), 2);
     }
 
     #[test]
@@ -309,6 +308,6 @@ mod tests {
         books.apply_snapshot("T", [], [], ts(1), ts(1)).unwrap();
         assert!(books.remove("T"));
         assert!(!books.remove("T"));
-        assert!(books.minute_snapshots(ts(2)).is_empty());
+        assert!(books.minute_snapshots(ts(2)).next().is_none());
     }
 }

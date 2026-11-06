@@ -19,6 +19,13 @@ use engineering_challenge::shard::ShardManager;
 use engineering_challenge::writer::{self, Output};
 use engineering_challenge::ws::connection::{ConnectionConfig, VerifyConfig};
 
+// glibc malloc fragments across tokio's threads: in 150 s full-scale runs
+// RSS was ~7 KB per symbol with glibc, ~4.7 KB with jemalloc (live data is
+// ~2 KB), and jemalloc handled frames fastest. glibc with 2 arenas used a
+// little less memory but took ~60% longer per frame.
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 #[derive(Parser, Debug)]
 #[command(about = "Records Polymarket order books in the challenge's SBE format")]
 struct Args {
