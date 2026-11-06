@@ -14,7 +14,8 @@ from datetime import datetime
 from pathlib import Path
 
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
-LINE = re.compile(r"^(\S+)\s+(\w+)\s+(\S+?):\s(.*)$")
+# Timestamped tracing lines only (not e.g. anyhow's final "Error: ..." line).
+LINE = re.compile(r"^(\d{4}-\d\d-\d\dT\S+)\s+(\w+)\s+(\S+?):\s(.*)$")
 FIELD = re.compile(r"(\w+)=(\S+)")
 
 
@@ -54,7 +55,8 @@ def main():
     if len(sys.argv) != 2:
         sys.exit(__doc__)
     log = Path(sys.argv[1])
-    base = log.with_suffix("")
+    # Not with_suffix: a run name may contain dots ("run.v1").
+    stem = str(log.parent / log.name.removesuffix(".log"))
 
     conn_last = {}
     tracked = []
@@ -100,7 +102,7 @@ def main():
     print(f"log:            {log}")
     print(f"span:           {first:%F %T} .. {last:%T} UTC ({secs / 60:.1f} min)")
 
-    info = base.with_suffix(".info")
+    info = Path(f"{stem}.info")
     output_bytes = None
     if info.exists():
         print("\n== run info")
@@ -151,6 +153,11 @@ def main():
         print(f"  {n:8}  {msg}")
     for msg, n in errors.most_common(10):
         print(f"  {n:8}  ERROR {msg}")
+    # The process's own exit error (anyhow), printed without a timestamp.
+    with open(log, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if line.startswith("Error:"):
+                print(f"  exit: {line.strip()}")
 
     print("\n== writer")
     print(f"  summary: {summary or '(no shutdown line)'}")
@@ -158,7 +165,7 @@ def main():
     if output_bytes is not None and secs > 0:
         print(f"  output: {output_bytes / 1e9:.2f} GB, {output_bytes / secs * 3600 / 1e9:.2f} GB/h")
 
-    mem = base.with_suffix(".mem")
+    mem = Path(f"{stem}.mem")
     if mem.exists():
         rows = [l.split() for l in mem.read_text().splitlines() if l and not l.startswith("#")]
         if rows:
@@ -172,7 +179,7 @@ def main():
                 print(f"  {r[0]}  +{int(r[1]):>5}s  rss {int(r[2]) / 2**20:6.2f} GiB  "
                       f"avail {int(r[4]) / 2**20:6.2f} GiB")
 
-    report = base.with_suffix(".validate")
+    report = Path(f"{stem}.validate")
     if report.exists():
         print("\n== validate")
         for line in report.read_text().splitlines():

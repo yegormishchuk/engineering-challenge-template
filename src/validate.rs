@@ -148,6 +148,25 @@ fn valid(price: i64, quantity: i64) -> bool {
     (0..=MAX_PRICE).contains(&price) && quantity >= 0
 }
 
+/// Why a file of `len` bytes cannot be a complete recording, if it cannot.
+/// The writer only writes whole chunks, and the template reader silently
+/// stops at a partial one, so a truncated or empty file would otherwise read
+/// as a short, consistent recording.
+pub fn file_size_problem(len: u64) -> Option<String> {
+    let chunk = crate::writer::CHUNK_SIZE as u64;
+    if len == 0 {
+        Some("empty file (the collector was killed before its first flush?)".into())
+    } else if !len.is_multiple_of(chunk) {
+        Some(format!(
+            "{len} bytes is not a whole number of {} MiB chunks: the file is truncated, and the last {} bytes are not read",
+            chunk >> 20,
+            len % chunk
+        ))
+    } else {
+        None
+    }
+}
+
 /// For display: `Buy`/`Sell` and fixed point as decimals.
 pub fn describe(symbol: &str, m: &LevelMismatch) -> String {
     let fmt = |q: Option<i64>| q.map_or("-".to_owned(), |q| format!("{:.6}", q as f64 / 1e6));
@@ -232,5 +251,15 @@ mod tests {
             exchange: Some(6_153_845),
         };
         assert_eq!(describe("T", &m), "T ask 0.650000: replayed - vs snapshot 6.153845");
+    }
+
+    #[test]
+    fn only_whole_chunks_make_a_complete_file() {
+        let chunk = crate::writer::CHUNK_SIZE as u64;
+        assert!(file_size_problem(0).is_some(), "an empty file holds nothing");
+        assert!(file_size_problem(1000).is_some(), "a partial chunk is never read");
+        assert!(file_size_problem(chunk + 1).is_some());
+        assert_eq!(file_size_problem(chunk), None);
+        assert_eq!(file_size_problem(3 * chunk), None);
     }
 }

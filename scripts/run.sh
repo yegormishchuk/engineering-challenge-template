@@ -41,20 +41,23 @@ mem=$runs/$name.mem
 info=$runs/$name.info
 report=$runs/$name.validate
 
-# Output: the collector's --output if given, else ~/runs/<name>.sbe.
+# Output: the collector's --output if given, else ~/runs/<name>.sbe. It is
+# taken out of the args and passed back as an absolute path, so the check
+# below, the collector (run from the repo) and validate all see one file.
 out=
+rest=()
 for ((i = 0; i < ${#args[@]}; i++)); do
     case ${args[i]} in
-        --output) out=${args[i+1]:-} ;;
+        --output) out=${args[i+1]:-}; i=$((i + 1)) ;;
         --output=*) out=${args[i]#--output=} ;;
+        *) rest+=("${args[i]}") ;;
     esac
 done
-if [[ -z $out ]]; then
-    out=$runs/$name.sbe
-    args+=(--output "$out")
-fi
+[[ -n $out ]] || out=$runs/$name.sbe
 case $out in -|/dev/stdout) echo "run.sh needs a file output, not stdout" >&2; exit 2 ;; esac
 out=${out/#\~/$HOME}
+[[ $out == /* ]] || out=$PWD/$out
+args=("${rest[@]}" --output "$out")
 for f in "$log" "$out"; do
     [[ -e $f ]] && { echo "$f exists; pick another name" >&2; exit 2; }
 done
@@ -97,7 +100,7 @@ echo "collector pid $pid; log $log; output $out" >&2
 
 sample() {
     local now rss hwm avail
-    now=$(date -u +%FT%TZ)
+    now=$(date -u +%FT%TZ) || return 0
     rss=$(awk '/^VmRSS:/ {print $2}' /proc/$pid/status 2>/dev/null) || return 0
     hwm=$(awk '/^VmHWM:/ {print $2}' /proc/$pid/status 2>/dev/null) || return 0
     [[ -n $rss ]] || return 0
@@ -122,12 +125,12 @@ done
 if kill -0 "$pid" 2>/dev/null; then
     sample
     echo "stopping: SIGINT $(date -u +%FT%TZ)" >> "$info"
-    kill -INT "$pid"
+    kill -INT "$pid" || true
     # Sample through the shutdown drain; force after 120 s.
     for _ in $(seq 120); do
         kill -0 "$pid" 2>/dev/null || break
         sample
-        sleep 1
+        sleep 1 || true  # a second Ctrl+C here must not end the script
     done
     if kill -0 "$pid" 2>/dev/null; then
         echo "collector still running 120 s after SIGINT; sending SIGINT again" | tee -a "$info" >&2

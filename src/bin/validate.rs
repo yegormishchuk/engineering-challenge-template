@@ -13,7 +13,7 @@ use engineering_challenge::util::dtos::challenge_orderbook::{
     AnyMessage, PriceLevelUpdateDomain, SnapshotDomain,
 };
 use engineering_challenge::util::{AlignedSbeReader, OrderbookSchema};
-use engineering_challenge::validate::{Validator, describe};
+use engineering_challenge::validate::{Validator, describe, file_size_problem};
 
 fn main() {
     let Some(path) = std::env::args().nth(1) else {
@@ -31,6 +31,7 @@ fn main() {
 
 fn run(path: &str) -> anyhow::Result<bool> {
     let started = Instant::now();
+    let size_problem = file_size_problem(std::fs::metadata(path)?.len());
     let mut reader = AlignedSbeReader::<OrderbookSchema>::open(path)?;
     // Read chunks on a second thread while this one decodes.
     let prefetch = reader.create_prefetch_task()?;
@@ -63,7 +64,10 @@ fn run(path: &str) -> anyhow::Result<bool> {
     for (symbol, m) in &r.first_mismatches {
         println!("  mismatch: {}", describe(symbol, m));
     }
-    let consistent = r.file_is_consistent();
+    if let Some(problem) = &size_problem {
+        println!("file size problem:         {problem}");
+    }
+    let consistent = r.file_is_consistent() && size_problem.is_none();
     println!("result:                    {}", if consistent { "CONSISTENT" } else { "INCONSISTENT" });
     if r.mismatched > 0 {
         println!(

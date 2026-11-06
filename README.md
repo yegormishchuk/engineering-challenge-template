@@ -166,7 +166,8 @@ replayed book with every later snapshot. Exit code 0 = consistent, 1 = not,
 | `invalid values` | negative values or prices above 1 USDC: must be 0 |
 | `unsorted snapshots` | levels out of order: must be 0 |
 | `receive time reversals` | a token's receive time going backwards: must be 0 |
-| `result` | `CONSISTENT` if the four "must be 0" lines are 0 |
+| `file size problem` | shown only if the file is empty or not a whole number of 64 MiB chunks (killed before its first flush, or truncated): the reader silently stops at a partial chunk, so such a file is never `CONSISTENT` |
+| `result` | `CONSISTENT` if the four "must be 0" lines are 0 and the size is whole chunks |
 
 `mismatched` is not a file error by itself: when the exchange sends a book
 that differs from the locally built one, the collector writes it as is (it is

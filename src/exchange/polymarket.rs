@@ -63,26 +63,34 @@ pub struct RestBook {
 
 /// Parses a [`BOOKS_URL`] response into the books that have at least one
 /// level, by symbol. Tokens without orders are absent from the response.
+///
+/// Strict: anything malformed is an error, never an empty side, because an
+/// empty side would confirm a wrong empty-book guess.
 pub fn parse_books_response(body: &str) -> Result<std::collections::HashMap<String, RestBook>, DecodeError> {
-    let books: Vec<Value> = serde_json::from_str(body).map_err(DecodeError::Json)?;
-    let side = |b: &Value, key: &str| -> Result<Vec<(i64, i64)>, DecodeError> {
-        let raw: Vec<RawLevel> = serde_json::from_value(b[key].clone()).unwrap_or_default();
-        levels(&raw).map(|mut l| {
+    #[derive(Deserialize)]
+    struct RawRestBook {
+        asset_id: String,
+        // Missing or null: no levels on that side.
+        #[serde(default)]
+        bids: Option<Vec<RawLevel>>,
+        #[serde(default)]
+        asks: Option<Vec<RawLevel>>,
+    }
+    let books: Vec<RawRestBook> = serde_json::from_str(body).map_err(DecodeError::Json)?;
+    let side = |raw: &Option<Vec<RawLevel>>| -> Result<Vec<(i64, i64)>, DecodeError> {
+        levels(raw.as_deref().unwrap_or_default()).map(|mut l| {
             l.retain(|&(_, q)| q != 0);
             l
         })
     };
     let mut out = std::collections::HashMap::new();
-    for b in &books {
-        let Some(symbol) = b["asset_id"].as_str() else {
-            continue;
-        };
+    for b in books {
         let book = RestBook {
-            bids: side(b, "bids")?,
-            asks: side(b, "asks")?,
+            bids: side(&b.bids)?,
+            asks: side(&b.asks)?,
         };
         if !book.bids.is_empty() || !book.asks.is_empty() {
-            out.insert(symbol.to_owned(), book);
+            out.insert(b.asset_id, book);
         }
     }
     Ok(out)
@@ -494,5 +502,23 @@ mod tests {
         assert_eq!(books["3"].asks, [(900_000, 1_000_000)], "zero sizes dropped");
         assert!(parse_books_response("{}").is_err());
         assert!(parse_books_response(r#"[{"asset_id":"1","bids":[{"price":"x","size":"1"}]}]"#).is_err());
+    }
+
+    #[test]
+    fn malformed_books_response_is_an_error_not_an_empty_book() {
+        // Each would otherwise read as "no orders" and confirm a wrong
+        // empty-book guess.
+        for body in [
+            r#"[{"asset_id":"1","bids":[{"price":0.1,"size":5}]}]"#,
+            r#"[{"asset_id":"1","bids":[{"price":"0.1"}]}]"#,
+            r#"[{"asset_id":"1","asks":"none"}]"#,
+            r#"[{"token_id":"1","bids":[{"price":"0.1","size":"5"}]}]"#,
+        ] {
+            assert!(parse_books_response(body).is_err(), "{body}");
+        }
+        // A missing or null side is an empty side.
+        let books = parse_books_response(r#"[{"asset_id":"1","bids":null,"asks":[{"price":"0.2","size":"1"}]}]"#)
+            .unwrap();
+        assert_eq!(books["1"].asks, [(200_000, 1_000_000)]);
     }
 }

@@ -21,9 +21,14 @@ pub fn next_minute(now: DateTime<Utc>) -> DateTime<Utc> {
 /// The boundary to wait for next: after `now`, and strictly after the last
 /// boundary sent. The second condition matters because tokio's timer can wake
 /// slightly before the wall clock reaches the boundary; without it the same
-/// boundary would fire twice.
+/// boundary would fire twice. A clock that is a second or more behind the
+/// last boundary was stepped back (NTP, VM resume); then `now` wins, or ticks
+/// would pause for as long as the step.
 pub fn next_tick(now: DateTime<Utc>, last_sent: Option<DateTime<Utc>>) -> DateTime<Utc> {
-    next_minute(last_sent.map_or(now, |last| now.max(last)))
+    match last_sent {
+        Some(last) if last - now < TimeDelta::seconds(1) => next_minute(now.max(last)),
+        _ => next_minute(now),
+    }
 }
 
 /// Sends each minute boundary on `tx` until `shutdown` is cancelled or every
@@ -76,6 +81,14 @@ mod tests {
             at("2026-11-05T10:19:00Z"),
             "after a long stall, skips missed boundaries instead of bursting"
         );
+    }
+
+    #[test]
+    fn a_backward_clock_step_does_not_pause_ticks() {
+        let boundary = at("2026-11-05T10:16:00Z");
+        // NTP or a VM resume moved the clock back an hour.
+        let stepped = at("2026-11-05T09:16:00.5Z");
+        assert_eq!(next_tick(stepped, Some(boundary)), at("2026-11-05T09:17:00Z"));
     }
 
     #[tokio::test]
