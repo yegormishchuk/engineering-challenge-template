@@ -1380,6 +1380,35 @@ async fn a_silent_symbol_is_resubscribed() {
 }
 
 #[tokio::test]
+async fn an_empty_guess_after_a_silent_resync_restarts_the_silence_clock() {
+    // A busy market whose orders all went: after the resync no book comes,
+    // so it gets an empty baseline. That must not look silent at once, or
+    // it is resynced every check, forever.
+    let (url, _log) = mock_server(|_, mut ws, log| async move {
+        next_text(&mut ws, &log, true).await;
+        send(&mut ws, BOOK_A).await;
+        for i in 0..6 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            send(&mut ws, &change_a(&(16 + i).to_string(), 1793822781010 + i)).await;
+        }
+        idle(ws, log).await;
+    })
+    .await;
+    let h = start(
+        ConnectionConfig {
+            empty_book_after: Duration::from_millis(100),
+            ..silence_cfg(url)
+        },
+        &["A"],
+    );
+    eventually("empty guess after the resync", || h.get(|s| &s.assumed_empty) == 1).await;
+    // min_silence is 300 ms; checks run every 50 ms.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(h.get(|s| &s.silent_resyncs), 1);
+    h.finish().await;
+}
+
+#[tokio::test]
 async fn a_quiet_market_is_not_resubscribed() {
     let (url, _log) = mock_server(|_, mut ws, log| async move {
         next_text(&mut ws, &log, true).await;

@@ -212,6 +212,30 @@ impl ShardSource {
         }
     }
 
+    /// Like [`Self::observe`] for a book that answers `member`'s own
+    /// subscription: marks the hash if a peer recorded it, but opens no
+    /// record. The book's hash is the symbol's current state, which a peer
+    /// subscribed long ago saw only if the symbol changed lately; a record
+    /// opened here would make every quiet symbol look lost on the peers
+    /// after each reconnect or recycle.
+    pub fn observe_existing(&self, member: usize, hash: &str, at: Instant) {
+        if self.members() == 1 {
+            return;
+        }
+        let bit = 1u32 << member;
+        let mut t = self.tracking();
+        if let Some(s) = t.seen.get_mut(hash)
+            && s.seen & bit == 0
+        {
+            s.seen |= bit;
+            if s.reported & bit != 0 {
+                let ms = at.saturating_duration_since(s.at).as_millis() as u64;
+                self.late_after_loss.fetch_add(1, Ordering::Relaxed);
+                self.late_after_loss_max_ms.fetch_max(ms, Ordering::Relaxed);
+            }
+        }
+    }
+
     /// Symbols `member` lost a message for: a peer received a hash at least
     /// `loss_after` before `cutoff` that `member` has not, and `member`'s
     /// book for the symbol was live before then (`live_since`). Each hash is
@@ -461,6 +485,22 @@ mod tests {
         // Old hashes are forgotten.
         s.check_lost(0, t0 + Duration::from_secs(60), live_before);
         assert!(s.tracking().seen.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_subscription_book_opens_no_loss_record() {
+        // After a reconnect (or recycle) a member's subscription brings a book
+        // for every symbol; for a symbol quiet longer than `keep`, its hash is
+        // no longer on record, and the peer will never receive it again.
+        let s = ShardSource::new(0, 2).with_detect(fast());
+        let t0 = Instant::now();
+        let live = |_: &str| Some(t0 - Duration::from_secs(1));
+        s.observe_existing(1, "q", t0);
+        assert!(s.check_lost(0, t0 + Duration::from_secs(3), live).is_empty());
+        // It still marks a record the peer opened.
+        s.observe(0, "A", "h", t0, true);
+        s.observe_existing(1, "h", t0);
+        assert!(s.check_lost(1, t0 + Duration::from_secs(3), live).is_empty());
     }
 
     #[tokio::test]

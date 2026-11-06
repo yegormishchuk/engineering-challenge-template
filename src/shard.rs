@@ -44,6 +44,9 @@ pub const RECYCLE_STUCK_AFTER: Duration = Duration::from_secs(600);
 
 struct Recycle {
     every: Duration,
+    /// First tick with symbols to recycle: the first order comes one spacing
+    /// later, not while connections are still subscribing at startup.
+    started: Option<Instant>,
     last: Option<Ordered>,
 }
 
@@ -118,25 +121,35 @@ impl ShardManager {
 
     /// Recycle every connection once per `every`, one at a time.
     pub fn with_recycle(mut self, every: Duration) -> Self {
-        self.recycle = Some(Recycle { every, last: None });
+        self.recycle = Some(Recycle {
+            every,
+            started: None,
+            last: None,
+        });
         self
     }
 
     /// Called periodically: tells the next connection to recycle when it is
     /// time, and returns its id. Connections with symbols take turns in id
-    /// order, `every / their number` apart; the next one waits until the
+    /// order, `every / their number` apart (the first one that long after the
+    /// first tick with symbols); the next one waits until the
     /// previous one has reconnected with books for 99% of its symbols (or
     /// skipped), or [`RECYCLE_STUCK_AFTER`] has passed.
     pub fn recycle_tick(&mut self, now: Instant) -> Option<usize> {
         let r = self.redundancy;
-        let recycle = self.recycle.as_ref()?;
+        self.recycle.as_ref()?;
         let busy: Vec<usize> = (0..self.slots.len() * r)
             .filter(|&c| self.slots[c / r].count > 0)
             .collect();
         if busy.is_empty() {
             return None;
         }
+        let started = *self.recycle.as_mut()?.started.get_or_insert(now);
+        let recycle = self.recycle.as_ref()?;
         let spacing = recycle.every / busy.len() as u32;
+        if recycle.last.is_none() && now.saturating_duration_since(started) < spacing {
+            return None;
+        }
         if let Some(last) = &recycle.last {
             let since = now.saturating_duration_since(last.at);
             if since < spacing {
@@ -387,13 +400,37 @@ mod tests {
         stats.live_baselines.store(*count as u64, Relaxed);
     }
 
+    /// Starts the schedule and orders the first recycle (connection 0), one
+    /// spacing (1 s for these tests) after the first tick. Returns that time.
+    fn start_recycling(m: &mut ShardManager) -> Instant {
+        let t0 = Instant::now();
+        assert_eq!(m.recycle_tick(t0), None, "the first tick only starts the clock");
+        let t1 = t0 + Duration::from_secs(1);
+        assert_eq!(m.recycle_tick(t1), Some(0));
+        t1
+    }
+
+    #[tokio::test]
+    async fn the_first_recycle_waits_one_spacing() {
+        // Not while the connections are still subscribing at startup.
+        let (m, writer, shutdown, _dir) = manager(3);
+        let mut m = m.with_recycle(Duration::from_secs(2));
+        m.add(syms(0..6)); // two connections: 1 s apart
+        let t0 = Instant::now();
+        assert_eq!(m.recycle_tick(t0), None);
+        assert_eq!(m.recycle_tick(t0 + Duration::from_millis(999)), None);
+        assert_eq!(m.recycle_tick(t0 + Duration::from_secs(1)), Some(0));
+        shutdown.cancel();
+        m.join().await;
+        writer.join().unwrap();
+    }
+
     #[tokio::test]
     async fn recycles_go_round_robin_one_at_a_time() {
         let (m, writer, shutdown, _dir) = manager(3);
         let mut m = m.with_recycle(Duration::from_secs(2));
         m.add(syms(0..6)); // two connections: 1 s apart
-        let t0 = Instant::now();
-        assert_eq!(m.recycle_tick(t0), Some(0));
+        let t0 = start_recycling(&mut m);
         assert_eq!(m.recycle_tick(t0 + Duration::from_secs(1)), None, "connection 0 is not back yet");
         mark_done(&m, 0);
         assert_eq!(m.recycle_tick(t0 + Duration::from_millis(500)), None, "too soon");
@@ -410,8 +447,7 @@ mod tests {
         let (m, writer, shutdown, _dir) = manager(3);
         let mut m = m.with_recycle(Duration::from_secs(2));
         m.add(syms(0..6));
-        let t0 = Instant::now();
-        assert_eq!(m.recycle_tick(t0), Some(0));
+        let t0 = start_recycling(&mut m);
         m.connections()[0].1.recycles.fetch_add(1, Relaxed);
         m.connections()[0].1.live_baselines.store(2, Relaxed); // of 3
         assert_eq!(m.recycle_tick(t0 + Duration::from_secs(1)), None);
@@ -427,8 +463,7 @@ mod tests {
         let (m, writer, shutdown, _dir) = manager(3);
         let mut m = m.with_recycle(Duration::from_secs(2));
         m.add(syms(0..6));
-        let t0 = Instant::now();
-        assert_eq!(m.recycle_tick(t0), Some(0));
+        let t0 = start_recycling(&mut m);
         assert_eq!(m.recycle_tick(t0 + RECYCLE_STUCK_AFTER - Duration::from_millis(1)), None);
         assert_eq!(m.recycle_tick(t0 + RECYCLE_STUCK_AFTER), Some(1));
         shutdown.cancel();

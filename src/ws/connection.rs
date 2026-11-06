@@ -963,7 +963,9 @@ impl Connection {
                     inc(&self.stats.dropped_during_resync);
                     return Ok(());
                 }
-                self.awaiting_book.remove(&symbol);
+                // A book answering our own subscription (vs. one sent
+                // mid-stream, which every member receives).
+                let subscribed = self.awaiting_book.remove(&symbol).is_some();
                 // A real exchange book settles any empty guess.
                 self.assumed.remove(&symbol);
                 self.suspect.remove(&symbol);
@@ -973,7 +975,13 @@ impl Connection {
                     Ok(applied) => {
                         inc(&self.stats.books);
                         self.books.note_activity(&symbol, self.frame_at);
-                        self.observe(&symbol, hash.as_deref(), false);
+                        if subscribed {
+                            if let (Some(m), Some(hash)) = (&self.member, hash.as_deref()) {
+                                m.shard.observe_existing(m.index, hash, self.frame_at);
+                            }
+                        } else {
+                            self.observe(&symbol, hash.as_deref(), false);
+                        }
                         self.note_mismatches(&symbol, &applied);
                         self.emit(applied.msg).await?;
                     }
@@ -1180,6 +1188,10 @@ impl Connection {
             .apply_snapshot(symbol, [], [], at, at)
             .expect("an empty book is always valid");
         inc(&self.stats.assumed_empty);
+        // Like an exchange book: restarts the symbol's silence clock (a
+        // market resynced for silence that has no orders gets this instead
+        // of a book, and would otherwise look silent again at once).
+        self.books.note_activity(symbol, std::time::Instant::now());
         self.assumed.insert(symbol.to_owned());
         self.note_mismatches(symbol, &applied);
         if self.cfg.verify.is_some() && !self.gave_up.contains(symbol) {
