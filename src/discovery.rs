@@ -150,12 +150,34 @@ pub fn parse_events_page(body: &str) -> anyhow::Result<(Vec<MarketObs>, Option<S
     Ok((markets, cursor))
 }
 
+/// Waits before each retry of a failed full-pass page. A pass is ~200 pages
+/// over ~10 min; without retries one slow page (Gamma timed out mid-body
+/// three times in one 30 min run on 2026-11-06) threw the pass away and
+/// the next one started again from page 1.
+const PAGE_RETRY_DELAYS: [Duration; 3] = [Duration::from_secs(1), Duration::from_secs(2), Duration::from_secs(4)];
+
+/// One full-pass page, retried after [`PAGE_RETRY_DELAYS`].
+async fn fetch_events_page(http: &reqwest::Client, url: &str) -> anyhow::Result<(Vec<MarketObs>, Option<String>)> {
+    let mut delays = PAGE_RETRY_DELAYS.iter();
+    loop {
+        let result = async { parse_events_page(&get_text(http, url).await?) }.await;
+        match (result, delays.next()) {
+            (Ok(page), _) => return Ok(page),
+            (Err(error), Some(&delay)) => {
+                warn!(%error, ?delay, "full-pass page failed; retrying");
+                tokio::time::sleep(delay).await;
+            }
+            (Err(error), None) => return Err(error),
+        }
+    }
+}
+
 /// Every open market (or up to `max_pages` pages), read through
 /// `/events/keyset`: 100 events (`limit` is capped at 100), about 900–1400
 /// markets per page, versus 100 per page from `/markets/keyset`. Each page is also sent on `pages` as it arrives, so
 /// subscriptions start long before a pass that takes minutes is done. Fails
-/// as a whole if any page fails, so a partial pass is never mistaken for the
-/// full set.
+/// as a whole if any page still fails after its retries, so a partial pass
+/// is never mistaken for the full set.
 pub async fn fetch_full(
     http: &reqwest::Client,
     base_url: &str,
@@ -172,7 +194,7 @@ pub async fn fetch_full(
             url.push_str(c);
         }
         let observed_at = Utc::now();
-        let (markets, next) = parse_events_page(&get_text(http, &url).await?)?;
+        let (markets, next) = fetch_events_page(http, &url).await?;
         // A page is a fresh observation of its markets, like a recent poll.
         pages
             .send(Poll::Recent { query: "full-page", observed_at, markets: markets.clone() })
@@ -561,6 +583,52 @@ mod tests {
 
     fn tracker() -> Tracker {
         Tracker::new(TrackerConfig::default())
+    }
+
+    /// A raw HTTP server that answers request `n` (from 0) with
+    /// `respond(n)` = (status line, body). Returns its base URL.
+    async fn http_server(respond: fn(usize) -> (&'static str, &'static str)) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let mut n = 0;
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0; 8192];
+                let _ = stream.read(&mut buf).await;
+                let (status, body) = respond(n);
+                n += 1;
+                let reply = format!(
+                    "HTTP/1.1 {status}
+Content-Type: application/json
+Content-Length: {}
+Connection: close
+
+{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(reply.as_bytes()).await;
+            }
+        });
+        url
+    }
+
+    const ONE_EVENT_PAGE: &str = r#"{"events":[{"markets":[{"conditionId":"c1","clobTokenIds":"[\"y\",\"n\"]","active":true,"closed":false,"acceptingOrders":true,"enableOrderBook":true}]}],"next_cursor":""}"#;
+
+    #[tokio::test]
+    async fn a_page_that_fails_once_is_retried_not_the_whole_pass() {
+        let url = http_server(|n| if n == 0 { ("500 Internal Server Error", "busy") } else { ("200 OK", ONE_EVENT_PAGE) }).await;
+        let (tx, mut rx) = mpsc::channel(8);
+        let markets = fetch_full(&reqwest::Client::new(), &url, None, &tx).await.unwrap();
+        assert_eq!(markets.len(), 1);
+        assert!(rx.try_recv().is_ok(), "the page was also sent as it arrived");
+    }
+
+    #[tokio::test]
+    async fn a_page_that_keeps_failing_fails_the_pass() {
+        let url = http_server(|_| ("500 Internal Server Error", "down")).await;
+        let (tx, _rx) = mpsc::channel(8);
+        assert!(fetch_full(&reqwest::Client::new(), &url, None, &tx).await.is_err());
     }
 
     const T0: &str = "2026-11-05T10:00:00Z";
