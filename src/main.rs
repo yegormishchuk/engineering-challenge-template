@@ -246,6 +246,8 @@ fn log_stats(shards: &ShardManager) {
             gap_mismatched_books = s.gap_mismatched_books.load(Relaxed),
             switch_snapshots = s.switch_snapshots.load(Relaxed),
             switch_without_baseline = s.switch_without_baseline.load(Relaxed),
+            silent_resyncs = s.silent_resyncs.load(Relaxed),
+            active_symbols = s.active_symbols.load(Relaxed),
             lock_wait_ms = s.lock_wait_us.load(Relaxed) / 1000,
             max_lock_wait_us = s.max_lock_wait_us.load(Relaxed),
             mb = s.bytes.load(Relaxed) / 1_000_000,

@@ -48,7 +48,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::books::{Books, BooksError, SnapshotApplied};
+use crate::books::{Books, BooksError, SilenceConfig, SnapshotApplied};
 use crate::exchange::{Event, polymarket};
 use crate::writer::{OutMsg, OutSender, WriterGone};
 use crate::ws::source::{ShardSource, State as SourceState};
@@ -159,6 +159,8 @@ pub struct ConnectionConfig {
     pub verify: Option<VerifyConfig>,
     /// How often a redundant member checks for lost messages and lag.
     pub shard_check_every: Duration,
+    /// When a symbol counts as gone quiet and is resubscribed (Extension 2).
+    pub silence: SilenceConfig,
 }
 
 impl Default for ConnectionConfig {
@@ -179,6 +181,7 @@ impl Default for ConnectionConfig {
             empty_book_on_change_after: Duration::from_millis(1500),
             verify: None,
             shard_check_every: Duration::from_millis(500),
+            silence: SilenceConfig::default(),
         }
     }
 }
@@ -234,6 +237,12 @@ pub struct ConnStats {
     /// Time spent waiting for the shard's output lock, total and longest, µs.
     pub lock_wait_us: AtomicU64,
     pub max_lock_wait_us: AtomicU64,
+    /// Active symbols resubscribed because they went quiet.
+    pub silent_resyncs: AtomicU64,
+    /// Gauges, as of the last check: symbols counted as active, and live
+    /// baselines (books that changes apply to).
+    pub active_symbols: AtomicU64,
+    pub live_baselines: AtomicU64,
 }
 
 fn inc(counter: &AtomicU64) {
@@ -516,9 +525,30 @@ impl Connection {
     }
 
     fn report_baselines(&self) {
+        let live = self.books.live_len();
+        self.stats.live_baselines.store(live as u64, Ordering::Relaxed);
         if let Some(m) = &self.member {
-            m.shard.set_baselines(m.index, self.books.live_len());
+            m.shard.set_baselines(m.index, live);
         }
+    }
+
+    /// Resubscribes active symbols that went quiet (Extension 2): the
+    /// exchange can stop sending a subscription without telling us.
+    async fn check_silence(&mut self, ws: &mut Ws) -> Result<(), Stop> {
+        let (mut silent, active) = self.books.silent(std::time::Instant::now(), &self.cfg.silence);
+        self.stats.active_symbols.store(active as u64, Ordering::Relaxed);
+        silent.truncate(self.cfg.silence.max_per_check);
+        if silent.is_empty() {
+            return Ok(());
+        }
+        add(&self.stats.silent_resyncs, silent.len());
+        warn!(
+            conn = self.id,
+            symbols = silent.len(),
+            first = %silent[0],
+            "symbols went quiet; resubscribing"
+        );
+        self.resync(ws, &silent).await
     }
 
     /// Runs until `shutdown` is cancelled or the command channel closes.
@@ -685,6 +715,8 @@ impl Connection {
         let mut verify_in_flight = false;
         let mut shard_check = tokio::time::interval(self.cfg.shard_check_every);
         shard_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut silence_check = tokio::time::interval(self.cfg.silence.check_every);
+        silence_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             tokio::select! {
@@ -726,6 +758,13 @@ impl Connection {
                 }
                 _ = shard_check.tick(), if self.member.is_some() => {
                     match self.check_shard(&mut ws).await {
+                        Ok(()) => {}
+                        Err(Stop::Lost(reason)) => return Ok(SessionEnd::Lost(reason)),
+                        Err(Stop::WriterGone) => return Err(WriterGone),
+                    }
+                }
+                _ = silence_check.tick() => {
+                    match self.check_silence(&mut ws).await {
                         Ok(()) => {}
                         Err(Stop::Lost(reason)) => return Ok(SessionEnd::Lost(reason)),
                         Err(Stop::WriterGone) => return Err(WriterGone),
@@ -891,6 +930,7 @@ impl Connection {
                 match self.books.apply_snapshot(&symbol, bids, asks, exchange_ts, received_at) {
                     Ok(applied) => {
                         inc(&self.stats.books);
+                        self.books.note_activity(&symbol, self.frame_at);
                         self.observe(&symbol, hash.as_deref(), false);
                         self.note_mismatches(&symbol, &applied);
                         self.emit(applied.msg).await?;
@@ -934,6 +974,7 @@ impl Connection {
                 match self.books.apply_level(&symbol, side, price, quantity, exchange_ts, received_at) {
                     Ok(msg) => {
                         inc(&self.stats.levels);
+                        self.books.note_activity(&symbol, self.frame_at);
                         self.observe(&symbol, hash.as_deref(), true);
                         self.emit(msg).await?;
                     }

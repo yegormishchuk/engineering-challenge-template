@@ -40,6 +40,27 @@ fn fast_cfg(url: String) -> ConnectionConfig {
         empty_book_on_change_after: Duration::from_secs(60),
         verify: None,
         shard_check_every: Duration::from_millis(20),
+        // Off unless a test turns it on (see `silence_cfg`).
+        silence: crate::books::SilenceConfig {
+            min_changes: u32::MAX,
+            ..Default::default()
+        },
+    }
+}
+
+/// `fast_cfg` with silence detection on: active after 3 events with a
+/// mean gap under 1 s; silent after max(5 x mean, 300 ms).
+fn silence_cfg(url: String) -> ConnectionConfig {
+    ConnectionConfig {
+        silence: crate::books::SilenceConfig {
+            check_every: Duration::from_millis(50),
+            min_changes: 3,
+            active_below: Duration::from_secs(1),
+            factor: 5.0,
+            min_silence: Duration::from_millis(300),
+            max_per_check: 100,
+        },
+        ..fast_cfg(url)
     }
 }
 
@@ -1325,4 +1346,61 @@ fn stamps_do_not_go_back_with_the_clock() {
     let t = |ms| chrono::DateTime::<Utc>::from_timestamp_millis(ms).unwrap();
     assert_eq!(monotonic(t(1000), t(900)), t(1000));
     assert_eq!(monotonic(t(614), t(1000)), t(1000), "a 386 ms step back is held");
+}
+
+// ---- Subscription monitoring (Extension 2) ----
+
+#[tokio::test]
+async fn a_silent_symbol_is_resubscribed() {
+    let (url, log) = mock_server(|_, mut ws, log| async move {
+        next_text(&mut ws, &log, true).await;
+        send(&mut ws, BOOK_A).await;
+        for i in 0..6 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            send(&mut ws, &change_a(&(16 + i).to_string(), 1793822781010 + i)).await;
+        }
+        // A goes quiet; the resubscription gets no book either.
+        idle(ws, log).await;
+    })
+    .await;
+    let h = start(silence_cfg(url), &["A"]);
+    eventually("A resubscribed", || h.get(|s| &s.silent_resyncs) == 1).await;
+    assert_eq!(h.get(|s| &s.levels), 6);
+    eventually("unsubscribe sent", || {
+        log.lock().unwrap().iter().any(|m| m.contains("\"operation\":\"unsubscribe\"") && m.contains("\"A\""))
+    })
+    .await;
+    // A now waits for a book: not live, so not flagged again.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(h.get(|s| &s.silent_resyncs), 1);
+    let msgs = h.finish().await;
+    let r = replay(&msgs);
+    assert!(r.file_is_consistent(), "{r:?}");
+    assert_eq!(r.updates_without_baseline, 0);
+}
+
+#[tokio::test]
+async fn a_quiet_market_is_not_resubscribed() {
+    let (url, _log) = mock_server(|_, mut ws, log| async move {
+        next_text(&mut ws, &log, true).await;
+        send(&mut ws, BOOK_A).await;
+        for i in 0..3 {
+            answer_for(&mut ws, &log, Duration::from_millis(1200)).await;
+            send(&mut ws, &change_a(&(16 + i).to_string(), 1793822781010 + i)).await;
+        }
+        idle(ws, log).await;
+    })
+    .await;
+    let h = start(silence_cfg(url), &["A"]);
+    // The changes come 1.2 s apart (longer than `eventually` waits).
+    for _ in 0..80 {
+        if h.get(|s| &s.levels) == 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(h.get(|s| &s.levels), 3);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!((h.get(|s| &s.silent_resyncs), h.get(|s| &s.resyncs)), (0, 0));
+    h.finish().await;
 }
