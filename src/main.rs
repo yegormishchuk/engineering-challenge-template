@@ -270,6 +270,9 @@ fn log_stats(shards: &ShardManager) {
             mb = s.bytes.load(Relaxed) / 1_000_000,
             busy_ms = s.busy_us.load(Relaxed) / 1000,
             max_frame_us = s.max_frame_us.load(Relaxed),
+            queue_ms = s.queue_us.load(Relaxed) / 1000,
+            max_queue_us = s.max_queue_us.load(Relaxed),
+            max_queued_frames = s.max_queued_frames.load(Relaxed),
             "connection stats"
         );
     }

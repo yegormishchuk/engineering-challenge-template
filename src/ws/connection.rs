@@ -51,7 +51,7 @@ use crate::exchange::{Event, polymarket};
 use crate::writer::{OutMsg, OutSender, WriterGone};
 use crate::ws::source::{ShardSource, State as SourceState};
 
-use crate::ws::reader::Ws;
+use crate::ws::reader::{self, Frame, RecvClock, Ws, WsSink};
 
 /// Spaces requests evenly, shared by every connection: at full scale ~100
 /// connections each start REST checks at about the same time.
@@ -230,6 +230,11 @@ pub struct ConnStats {
     pub busy_us: AtomicU64,
     /// Longest single frame handling time, in µs.
     pub max_frame_us: AtomicU64,
+    /// Time frames waited between being read and being handled, total and
+    /// longest, µs; and the most frames read but not yet handled.
+    pub queue_us: AtomicU64,
+    pub max_queue_us: AtomicU64,
+    pub max_queued_frames: AtomicU64,
     /// Snapshots written because this connection became its shard's source.
     pub switch_snapshots: AtomicU64,
     /// Symbols without a live book when this connection became the source:
@@ -264,11 +269,6 @@ struct Verified {
     result: Result<HashMap<String, polymarket::RestBook>, String>,
 }
 
-/// `now`, or `last` if the clock went back.
-fn monotonic(now: DateTime<Utc>, last: DateTime<Utc>) -> DateTime<Utc> {
-    now.max(last)
-}
-
 /// Levels as `(side is bid, price, quantity)`, for comparing books.
 type LevelSet = HashSet<(bool, i64, i64)>;
 
@@ -277,6 +277,14 @@ fn level_set(bids: &[(i64, i64)], asks: &[(i64, i64)]) -> LevelSet {
         .map(|&(p, q)| (true, p, q))
         .chain(asks.iter().map(|&(p, q)| (false, p, q)))
         .collect()
+}
+
+/// The next frame to handle: the held one, else the next from the reader.
+async fn next_frame(held: &mut Option<Frame>, rx: &mut mpsc::UnboundedReceiver<Frame>) -> Option<Frame> {
+    match held.take() {
+        Some(frame) => Some(frame),
+        None => rx.recv().await,
+    }
 }
 
 /// This connection's place in a shard of redundant connections.
@@ -292,10 +300,13 @@ pub struct Connection {
     member: Option<Member>,
     /// The shard's switch epoch this connection last wrote under.
     seen_epoch: u64,
-    /// Receive instant of the frame being handled, for hash tracking.
+    /// Read instant of the frame being handled, for hash tracking.
     frame_at: std::time::Instant,
-    /// The latest output timestamp taken; see [`Self::stamp`].
-    last_stamp: DateTime<Utc>,
+    /// Receive times for this connection's output (see [`RecvClock`]).
+    clock: Arc<RecvClock>,
+    /// A frame taken from the queue by [`Self::catch_up`] but read at or
+    /// after its cut-off: the next one to handle.
+    held: Option<Frame>,
     cfg: ConnectionConfig,
     /// In the order they were added, so a market's tokens (added together)
     /// stay in the same subscription batch after a reconnect.
@@ -386,7 +397,8 @@ impl Connection {
             member: None,
             seen_epoch: 0,
             frame_at: std::time::Instant::now(),
-            last_stamp: DateTime::<Utc>::MIN_UTC,
+            clock: RecvClock::new(),
+            held: None,
             cfg,
             symbols: IndexSet::new(),
             books: Books::new(),
@@ -412,15 +424,6 @@ impl Connection {
             verify_not_before: Instant::now(),
             verify_backoff: Duration::ZERO,
         }
-    }
-
-    /// The wall-clock time for output, never earlier than the previous one
-    /// taken on this connection. The host clock can step back (WSL2 resyncs
-    /// with Windows: a 386 ms step was seen live), and a symbol's receive
-    /// times must not go backwards.
-    fn stamp(&mut self) -> DateTime<Utc> {
-        self.last_stamp = monotonic(Utc::now(), self.last_stamp);
-        self.last_stamp
     }
 
     /// Makes this connection one of a shard's redundant members.
@@ -503,7 +506,7 @@ impl Connection {
     /// Resyncs symbols a peer received changes for that this connection
     /// missed, and lets the shard hand over if this is a lagging or lossy
     /// source.
-    async fn check_shard(&mut self, ws: &mut Ws) -> Result<(), Stop> {
+    async fn check_shard(&mut self, ws: &mut WsSink) -> Result<(), Stop> {
         let Some(m) = self.member.clone() else {
             return Ok(());
         };
@@ -557,7 +560,7 @@ impl Connection {
 
     /// Resubscribes active symbols that went quiet (Extension 2): the
     /// exchange can stop sending a subscription without telling us.
-    async fn check_silence(&mut self, ws: &mut Ws) -> Result<(), Stop> {
+    async fn check_silence(&mut self, ws: &mut WsSink) -> Result<(), Stop> {
         let (mut silent, active) = self.books.silent(std::time::Instant::now(), &self.cfg.silence);
         self.stats.active_symbols.store(active as u64, Ordering::Relaxed);
         silent.truncate(self.cfg.silence.max_per_check);
@@ -686,7 +689,7 @@ impl Connection {
         self.symbols.shift_remove(s)
     }
 
-    async fn ws_send(&self, ws: &mut Ws, text: String) -> Result<(), String> {
+    async fn ws_send(&self, ws: &mut WsSink, text: String) -> Result<(), String> {
         match tokio::time::timeout(self.cfg.send_timeout, ws.send(Message::text(text))).await {
             Ok(result) => result.map_err(|e| e.to_string()),
             Err(_) => Err(format!("websocket send timed out after {:?}", self.cfg.send_timeout)),
@@ -694,7 +697,7 @@ impl Connection {
     }
 
     /// Sends a `PING` and returns its number.
-    async fn send_ping(&mut self, ws: &mut Ws) -> Result<u64, String> {
+    async fn send_ping(&mut self, ws: &mut WsSink) -> Result<u64, String> {
         self.ws_send(ws, polymarket::PING.to_owned()).await?;
         let n = self.next_ping;
         self.next_ping += 1;
@@ -702,15 +705,37 @@ impl Connection {
         Ok(n)
     }
 
-    async fn close(&self, ws: &mut Ws) {
-        if tokio::time::timeout(self.cfg.close_timeout, ws.close(None)).await.is_err() {
+    async fn close(&self, ws: &mut WsSink) {
+        if tokio::time::timeout(self.cfg.close_timeout, ws.close()).await.is_err() {
             debug!(conn = self.id, "websocket close timed out");
         }
     }
 
+    /// Runs one socket. A reader task reads and stamps its frames (see
+    /// [`reader`]); this task handles them in order, and before other work
+    /// that writes output or judges the stream, first handles every frame
+    /// read before that moment (see [`Self::catch_up`]).
     async fn session(
         &mut self,
-        mut ws: Ws,
+        ws: Ws,
+        cmds: &mut mpsc::UnboundedReceiver<Command>,
+        ticks: &mut watch::Receiver<DateTime<Utc>>,
+        shutdown: &CancellationToken,
+    ) -> Result<SessionEnd, WriterGone> {
+        let (mut sink, stream) = ws.split();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let reader = reader::spawn_reader(stream, Arc::clone(&self.clock), tx, Arc::clone(&self.stats));
+        self.held = None;
+        let end = self.handle_socket(&mut sink, &mut rx, cmds, ticks, shutdown).await;
+        reader.abort();
+        self.held = None;
+        end
+    }
+
+    async fn handle_socket(
+        &mut self,
+        ws: &mut WsSink,
+        rx: &mut mpsc::UnboundedReceiver<Frame>,
         cmds: &mut mpsc::UnboundedReceiver<Command>,
         ticks: &mut watch::Receiver<DateTime<Utc>>,
         shutdown: &CancellationToken,
@@ -739,7 +764,6 @@ impl Connection {
         let mut ping = tokio::time::interval(self.cfg.ping_interval);
         ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         ping.tick().await; // the first tick is immediate
-        let mut last_pong = Instant::now();
         let verify_every = self.cfg.verify.as_ref().map_or(Duration::from_secs(3600), |v| v.every);
         let mut verify_tick = tokio::time::interval(verify_every);
         verify_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -754,62 +778,52 @@ impl Connection {
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => {
-                    self.close(&mut ws).await;
+                    // Frames already read are written before the socket closes.
+                    let t = self.clock.stamp();
+                    if let Some(end) = self.catch_up(ws, rx, t).await? {
+                        return Ok(end);
+                    }
+                    self.close(ws).await;
                     return Ok(SessionEnd::Shutdown);
                 }
-                frame = ws.next() => {
-                    // Stamp first, before any parsing.
-                    let received_at = self.stamp();
-                    let text = match frame {
-                        None => return Ok(SessionEnd::Lost("stream ended".into())),
-                        Some(Err(e)) => return Ok(SessionEnd::Lost(e.to_string())),
-                        Some(Ok(Message::Text(text))) => text,
-                        Some(Ok(Message::Close(frame))) => {
-                            return Ok(SessionEnd::Lost(format!("closed by server: {frame:?}")));
-                        }
-                        Some(Ok(_)) => continue, // protocol pings are answered by tungstenite
+                frame = next_frame(&mut self.held, rx) => {
+                    let Some(frame) = frame else {
+                        return Ok(SessionEnd::Lost("reader task stopped".into()));
                     };
-                    inc(&self.stats.frames);
-                    add(&self.stats.bytes, text.len());
-                    let busy = std::time::Instant::now();
-                    self.frame_at = busy;
-                    // Settle who writes before applying the frame, so a
-                    // switch snapshot shows the books as they were before it.
-                    if self.member.is_some() {
-                        drop(self.begin_output(received_at).await?);
-                    }
-                    let result = self.on_text(&mut ws, &text, received_at, &mut last_pong).await;
-                    self.report_baselines();
-                    let us = busy.elapsed().as_micros() as u64;
-                    self.stats.busy_us.fetch_add(us, Ordering::Relaxed);
-                    self.stats.max_frame_us.fetch_max(us, Ordering::Relaxed);
-                    match result {
-                        Ok(()) => {}
-                        Err(Stop::Lost(reason)) => return Ok(SessionEnd::Lost(reason)),
-                        Err(Stop::WriterGone) => return Err(WriterGone),
+                    self.note_queue(&frame, rx.len());
+                    if let Some(end) = self.on_frame(ws, frame).await? {
+                        return Ok(end);
                     }
                 }
                 _ = shard_check.tick(), if self.member.is_some() => {
-                    match self.check_shard(&mut ws).await {
+                    let t = self.clock.stamp();
+                    if let Some(end) = self.catch_up(ws, rx, t).await? {
+                        return Ok(end);
+                    }
+                    match self.check_shard(ws).await {
                         Ok(()) => {}
                         Err(Stop::Lost(reason)) => return Ok(SessionEnd::Lost(reason)),
                         Err(Stop::WriterGone) => return Err(WriterGone),
                     }
                 }
                 _ = silence_check.tick() => {
-                    match self.check_silence(&mut ws).await {
+                    match self.check_silence(ws).await {
                         Ok(()) => {}
                         Err(Stop::Lost(reason)) => return Ok(SessionEnd::Lost(reason)),
                         Err(Stop::WriterGone) => return Err(WriterGone),
                     }
                 }
                 _ = pace.tick(), if !self.pending.is_empty() => {
-                    if let Err(reason) = self.send_next_batch(&mut ws).await {
+                    if let Err(reason) = self.send_next_batch(ws).await {
                         return Ok(SessionEnd::Lost(reason));
                     }
                 }
                 _ = empty_check.tick(), if !self.awaiting_book.is_empty() => {
-                    self.assume_empty_books().await?;
+                    let t = self.clock.stamp();
+                    if let Some(end) = self.catch_up(ws, rx, t).await? {
+                        return Ok(end);
+                    }
+                    self.assume_empty_books(t).await?;
                 }
                 _ = verify_tick.tick(), if !verify_in_flight
                     && !self.to_verify.is_empty()
@@ -820,26 +834,39 @@ impl Connection {
                 }
                 Some(verified) = verified_rx.recv() => {
                     verify_in_flight = false;
-                    let barrier = match self.send_ping(&mut ws).await {
+                    let barrier = match self.send_ping(ws).await {
                         Ok(n) => n,
                         Err(reason) => return Ok(SessionEnd::Lost(reason)),
                     };
                     self.verify_waiting.push_back((barrier, verified));
                 }
                 _ = ping.tick() => {
-                    if last_pong.elapsed() > self.cfg.pong_timeout {
-                        return Ok(SessionEnd::Lost(format!(
-                            "no PONG for {:?}", last_pong.elapsed()
-                        )));
+                    // A PING counts as answered once its PONG has been read,
+                    // even if not yet handled. Judged by the oldest PING still
+                    // unanswered: while the writer stalls this task, no PING
+                    // is sent, so none can be answered.
+                    let t = self.clock.stamp();
+                    if let Some(end) = self.catch_up(ws, rx, t).await? {
+                        return Ok(end);
                     }
-                    if let Err(reason) = self.send_ping(&mut ws).await {
+                    if let Some(&(_, sent)) = self.pings.front()
+                        && sent.elapsed() > self.cfg.pong_timeout
+                    {
+                        return Ok(SessionEnd::Lost(format!("no PONG for {:?}", sent.elapsed())));
+                    }
+                    if let Err(reason) = self.send_ping(ws).await {
                         return Ok(SessionEnd::Lost(reason));
                     }
                 }
                 cmd = cmds.recv() => {
                     let result = match cmd {
                         None => {
-                            self.close(&mut ws).await;
+                            // Frames already read are written before the close.
+                            let t = self.clock.stamp();
+                            if let Some(end) = self.catch_up(ws, rx, t).await? {
+                                return Ok(end);
+                            }
+                            self.close(ws).await;
                             return Ok(SessionEnd::Shutdown);
                         }
                         Some(Command::Add(symbols)) => {
@@ -855,7 +882,11 @@ impl Connection {
                         }
                         Some(Command::Recycle) => {
                             if self.release_for_recycle().await {
-                                self.close(&mut ws).await;
+                                let t = self.clock.stamp();
+                                if let Some(end) = self.catch_up(ws, rx, t).await? {
+                                    return Ok(end);
+                                }
+                                self.close(ws).await;
                                 return Ok(SessionEnd::Recycle);
                             }
                             Ok(())
@@ -868,7 +899,7 @@ impl Connection {
                             let gone_set: HashSet<&String> = gone.iter().collect();
                             self.pending.retain(|p| !gone_set.contains(p));
                             self.to_verify.retain(|p| !gone_set.contains(p));
-                            self.unsubscribe_removed(&mut ws, &gone).await
+                            self.unsubscribe_removed(ws, &gone).await
                         }
                     };
                     if let Err(reason) = result {
@@ -880,7 +911,11 @@ impl Connection {
                         self.ticks_open = false;
                         continue;
                     }
-                    let emitted_at = self.stamp();
+                    // The snapshot reflects every frame read before it.
+                    let emitted_at = self.clock.stamp();
+                    if let Some(end) = self.catch_up(ws, rx, emitted_at).await? {
+                        return Ok(end);
+                    }
                     if let Some(mut guard) = self.begin_output(emitted_at).await? {
                         for msg in self.books.minute_snapshots(emitted_at) {
                             self.write(guard.as_deref_mut(), msg).await?;
@@ -892,12 +927,86 @@ impl Connection {
         }
     }
 
+    /// Counts how long `frame` waited, and the queue behind it.
+    fn note_queue(&self, frame: &Frame, queued: usize) {
+        let us = frame.at.elapsed().as_micros() as u64;
+        self.stats.queue_us.fetch_add(us, Ordering::Relaxed);
+        self.stats.max_queue_us.fetch_max(us, Ordering::Relaxed);
+        self.stats.max_queued_frames.fetch_max(queued as u64, Ordering::Relaxed);
+        if queued >= 1024 && queued.is_power_of_two() {
+            warn!(conn = self.id, queued, "frame backlog growing");
+        }
+    }
+
+    /// Handles one frame from the reader. `Some`: the session ends.
+    async fn on_frame(
+        &mut self,
+        ws: &mut WsSink,
+        frame: Frame,
+    ) -> Result<Option<SessionEnd>, WriterGone> {
+        let text = match frame.msg {
+            Err(reason) => return Ok(Some(SessionEnd::Lost(reason))),
+            Ok(Message::Text(text)) => text,
+            Ok(Message::Close(close)) => {
+                return Ok(Some(SessionEnd::Lost(format!("closed by server: {close:?}"))));
+            }
+            Ok(_) => return Ok(None), // protocol pings are answered by tungstenite
+        };
+        let busy = std::time::Instant::now();
+        self.frame_at = frame.at;
+        // Settle who writes before applying the frame, so a switch snapshot
+        // shows the books as they were before it.
+        if self.member.is_some() {
+            drop(self.begin_output(frame.received_at).await?);
+        }
+        let result = self.on_text(ws, &text, frame.received_at).await;
+        self.report_baselines();
+        let us = busy.elapsed().as_micros() as u64;
+        self.stats.busy_us.fetch_add(us, Ordering::Relaxed);
+        self.stats.max_frame_us.fetch_max(us, Ordering::Relaxed);
+        match result {
+            Ok(()) => Ok(None),
+            Err(Stop::Lost(reason)) => Ok(Some(SessionEnd::Lost(reason))),
+            Err(Stop::WriterGone) => Err(WriterGone),
+        }
+    }
+
+    /// Handles every queued frame read before `until`; the first later one
+    /// is kept in `held`. Output stamped `until` then comes after every
+    /// frame read before it, and before every frame read at or after it.
+    async fn catch_up(
+        &mut self,
+        ws: &mut WsSink,
+        rx: &mut mpsc::UnboundedReceiver<Frame>,
+        until: DateTime<Utc>,
+    ) -> Result<Option<SessionEnd>, WriterGone> {
+        loop {
+            let frame = match self.held.take() {
+                Some(frame) => frame,
+                None => match rx.try_recv() {
+                    Ok(frame) => frame,
+                    Err(mpsc::error::TryRecvError::Empty) => return Ok(None),
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        return Ok(Some(SessionEnd::Lost("reader task stopped".into())));
+                    }
+                },
+            };
+            if frame.received_at >= until {
+                self.held = Some(frame);
+                return Ok(None);
+            }
+            self.note_queue(&frame, rx.len());
+            if let Some(end) = self.on_frame(ws, frame).await? {
+                return Ok(Some(end));
+            }
+        }
+    }
+
     async fn on_text(
         &mut self,
-        ws: &mut Ws,
+        ws: &mut WsSink,
         text: &str,
         received_at: DateTime<Utc>,
-        last_pong: &mut Instant,
     ) -> Result<(), Stop> {
         let decoded = match polymarket::decode(text) {
             Ok(decoded) => decoded,
@@ -934,17 +1043,16 @@ impl Connection {
             self.resync(ws, &ours).await?;
         }
         for event in decoded.events {
-            self.on_event(ws, event, received_at, last_pong).await?;
+            self.on_event(ws, event, received_at).await?;
         }
         Ok(())
     }
 
     async fn on_event(
         &mut self,
-        ws: &mut Ws,
+        ws: &mut WsSink,
         event: Event,
         received_at: DateTime<Utc>,
-        last_pong: &mut Instant,
     ) -> Result<(), Stop> {
         match event {
             Event::Book {
@@ -1034,7 +1142,6 @@ impl Connection {
                 }
             }
             Event::Pong => {
-                *last_pong = Instant::now();
                 if let Some((acked, sent_at)) = self.pings.pop_front() {
                     self.acked_through = Some(acked);
                     self.acked_sent_at = Some(sent_at);
@@ -1048,7 +1155,7 @@ impl Connection {
                     }
                     // The barrier just moved: books still missing now are
                     // not coming.
-                    self.assume_empty_books().await?;
+                    self.assume_empty_books(received_at).await?;
                 }
             }
             event @ (Event::MarketAdded { .. } | Event::MarketResolved { .. }) => {
@@ -1094,7 +1201,7 @@ impl Connection {
 
     /// Stops trusting the books of `symbols` and asks the exchange for fresh
     /// ones: unsubscribe now, subscribe again through the paced queue.
-    async fn resync(&mut self, ws: &mut Ws, symbols: &[String]) -> Result<(), Stop> {
+    async fn resync(&mut self, ws: &mut WsSink, symbols: &[String]) -> Result<(), Stop> {
         if symbols.is_empty() {
             return Ok(());
         }
@@ -1127,7 +1234,7 @@ impl Connection {
 
     /// Sends the next batch of pending subscriptions. The first message on a
     /// socket uses the initial format.
-    async fn send_next_batch(&mut self, ws: &mut Ws) -> Result<(), String> {
+    async fn send_next_batch(&mut self, ws: &mut WsSink) -> Result<(), String> {
         let n = self.pending.len().min(self.cfg.subscribe_batch);
         let batch: Vec<String> = self.pending.drain(..n).collect();
         if batch.is_empty() {
@@ -1154,8 +1261,8 @@ impl Connection {
     }
 
     /// Gives every symbol whose `book` is overdue an empty baseline and
-    /// writes it as a snapshot.
-    async fn assume_empty_books(&mut self) -> Result<(), WriterGone> {
+    /// writes it as a snapshot stamped `at`.
+    async fn assume_empty_books(&mut self, at: DateTime<Utc>) -> Result<(), WriterGone> {
         let grace = self.cfg.empty_book_after;
         let Some(acked) = self.acked_through else {
             return Ok(());
@@ -1168,7 +1275,6 @@ impl Connection {
             .collect();
         overdue.sort_unstable();
         for symbol in overdue {
-            let at = self.stamp();
             self.assume_empty(&symbol, at).await?;
         }
         Ok(())
@@ -1236,7 +1342,7 @@ impl Connection {
         });
     }
 
-    async fn on_verified(&mut self, ws: &mut Ws, verified: Verified) -> Result<(), Stop> {
+    async fn on_verified(&mut self, ws: &mut WsSink, verified: Verified) -> Result<(), Stop> {
         let Some(verify) = self.cfg.verify.clone() else {
             return Ok(());
         };
@@ -1330,7 +1436,7 @@ impl Connection {
 
     /// Unsubscribes removed symbols and sends a barrier `PING`, remembered
     /// in case a symbol is added back before old data is drained.
-    async fn unsubscribe_removed(&mut self, ws: &mut Ws, gone: &[String]) -> Result<(), String> {
+    async fn unsubscribe_removed(&mut self, ws: &mut WsSink, gone: &[String]) -> Result<(), String> {
         if gone.is_empty() || !self.initial_sent {
             return Ok(());
         }
@@ -1344,7 +1450,7 @@ impl Connection {
 
     /// Unsubscribes at once (no book burst follows). Nothing to do before the
     /// socket's first subscription.
-    async fn send_unsubscribe(&self, ws: &mut Ws, symbols: &[String]) -> Result<(), String> {
+    async fn send_unsubscribe(&self, ws: &mut WsSink, symbols: &[String]) -> Result<(), String> {
         if !self.initial_sent {
             return Ok(());
         }

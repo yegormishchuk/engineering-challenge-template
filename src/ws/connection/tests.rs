@@ -193,15 +193,25 @@ struct Harness {
     shutdown: CancellationToken,
     stats: Arc<ConnStats>,
     task: tokio::task::JoinHandle<Result<(), WriterGone>>,
-    writer: writer::WriterHandle,
+    /// `None` with a [`writer::test_channel`]: the test reads the output.
+    writer: Option<writer::WriterHandle>,
     path: std::path::PathBuf,
-    _dir: tempfile::TempDir,
+    _dir: Option<tempfile::TempDir>,
 }
 
 fn start(cfg: ConnectionConfig, symbols: &[&str]) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("out.sbe");
     let (out, writer) = writer::spawn(&Output::File(path.clone()), 1024).unwrap();
+    Harness {
+        writer: Some(writer),
+        path,
+        _dir: Some(dir),
+        ..start_with_out(cfg, symbols, out)
+    }
+}
+
+fn start_with_out(cfg: ConnectionConfig, symbols: &[&str], out: OutSender) -> Harness {
     let stats = Arc::new(ConnStats::default());
     let (cmds, cmd_rx) = mpsc::unbounded_channel();
     let (ticks, tick_rx) = watch::channel(Utc::now());
@@ -216,9 +226,9 @@ fn start(cfg: ConnectionConfig, symbols: &[&str]) -> Harness {
         shutdown,
         stats,
         task,
-        writer,
-        path,
-        _dir: dir,
+        writer: None,
+        path: std::path::PathBuf::new(),
+        _dir: None,
     }
 }
 
@@ -227,6 +237,8 @@ impl Harness {
         f(&self.stats).load(Ordering::Relaxed)
     }
 
+    /// Stops the connection. Returns the output file's messages; empty with
+    /// a test channel.
     async fn finish(self) -> Vec<OutMsg> {
         self.shutdown.cancel();
         tokio::time::timeout(Duration::from_secs(2), self.task)
@@ -235,8 +247,36 @@ impl Harness {
             .unwrap()
             .unwrap();
         drop(self.cmds);
-        self.writer.join().unwrap();
-        read_all(&self.path)
+        match self.writer {
+            Some(writer) => {
+                writer.join().unwrap();
+                read_all(&self.path)
+            }
+            None => Vec::new(),
+        }
+    }
+}
+
+/// Drains a test channel from now on. The task ends once the connection
+/// (the only sender) is gone.
+fn drain(mut rx: mpsc::Receiver<OutMsg>) -> (Arc<Mutex<Vec<OutMsg>>>, tokio::task::JoinHandle<()>) {
+    let got = Arc::new(Mutex::new(Vec::new()));
+    let task = tokio::spawn({
+        let got = Arc::clone(&got);
+        async move {
+            while let Some(m) = rx.recv().await {
+                got.lock().unwrap().push(m);
+            }
+        }
+    });
+    (got, task)
+}
+
+/// The receive time a message carries.
+fn received_at(m: &OutMsg) -> chrono::DateTime<Utc> {
+    match m {
+        OutMsg::Snapshot(s) => s.received_at,
+        OutMsg::Update(u) => u.backtest_timestamp,
     }
 }
 
@@ -1351,13 +1391,6 @@ async fn a_slow_reader_is_not_taken_for_a_lost_message() {
     h.finish().await;
 }
 
-#[test]
-fn stamps_do_not_go_back_with_the_clock() {
-    let t = |ms| chrono::DateTime::<Utc>::from_timestamp_millis(ms).unwrap();
-    assert_eq!(monotonic(t(1000), t(900)), t(1000));
-    assert_eq!(monotonic(t(614), t(1000)), t(1000), "a 386 ms step back is held");
-}
-
 // ---- Subscription monitoring (Extension 2) ----
 
 #[tokio::test]
@@ -1509,4 +1542,163 @@ async fn recycling_the_source_without_a_ready_peer_is_skipped() {
     eventually("skipped", || h.get(0, |s| &s.recycles_skipped) == 1).await;
     assert_eq!((h.get(0, |s| &s.recycles), h.get(0, |s| &s.connects), h.switches()), (0, 1, 0));
     h.finish().await;
+}
+
+// ---- A slow writer must not delay receive times (Part A) ----
+
+/// `BOOK_A`, then `n` changes for A (sizes 16, 17, ...) with `gap` before
+/// each. Returns the wall time taken just before each send.
+async fn book_then_changes(ws: &mut ServerWs, n: i64, gap: Duration) -> Vec<chrono::DateTime<Utc>> {
+    let mut sent = vec![Utc::now()];
+    send(ws, BOOK_A).await;
+    for i in 0..n {
+        if !gap.is_zero() {
+            tokio::time::sleep(gap).await;
+        }
+        sent.push(Utc::now());
+        send(ws, &change_a(&(16 + i).to_string(), 1793822781010 + i)).await;
+    }
+    sent
+}
+
+#[tokio::test]
+async fn receive_times_do_not_wait_for_a_full_writer() {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let (url, _log) = mock_server({
+        let sent = Arc::clone(&sent);
+        move |_, mut ws, log| {
+            let sent = Arc::clone(&sent);
+            async move {
+                next_text(&mut ws, &log, true).await;
+                let times = book_then_changes(&mut ws, 5, Duration::from_millis(100)).await;
+                *sent.lock().unwrap() = times;
+                idle(ws, log).await;
+            }
+        }
+    })
+    .await;
+    let (out, rx) = writer::test_channel(1);
+    let h = start_with_out(fast_cfg(url), &["A"], out);
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    let (got, drained) = drain(rx);
+    eventually("6 messages", || got.lock().unwrap().len() == 6).await;
+    assert!(h.get(|s| &s.max_queued_frames) >= 3, "{}", h.get(|s| &s.max_queued_frames));
+    h.finish().await;
+    drained.await.unwrap();
+
+    let msgs = got.lock().unwrap().clone();
+    let sent = sent.lock().unwrap().clone();
+    assert_eq!((msgs.len(), sent.len()), (6, 6));
+    for (m, at) in msgs.iter().zip(&sent).skip(1) {
+        let OutMsg::Update(u) = m else { panic!("{m:?}") };
+        let late = (u.backtest_timestamp - *at).num_milliseconds();
+        assert!((0..50).contains(&late), "stamped {late} ms after the send");
+    }
+}
+
+#[tokio::test]
+async fn a_stalled_writer_does_not_trip_the_pong_timeout() {
+    let (url, _log) = mock_server(|_, mut ws, log| async move {
+        next_text(&mut ws, &log, true).await;
+        book_then_changes(&mut ws, 20, Duration::ZERO).await;
+        idle(ws, log).await;
+    })
+    .await;
+    let mut cfg = fast_cfg(url);
+    cfg.pong_timeout = Duration::from_millis(300);
+    let (out, rx) = writer::test_channel(1);
+    let h = start_with_out(cfg, &["A"], out);
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let (got, drained) = drain(rx);
+    eventually("all written", || got.lock().unwrap().len() >= 21).await;
+    // A few ping rounds after the stall.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(h.get(|s| &s.disconnects), 0);
+    h.finish().await;
+    drained.await.unwrap();
+}
+
+#[tokio::test]
+async fn a_minute_snapshot_under_backlog_keeps_receive_order() {
+    let (url, _log) = mock_server(|_, mut ws, log| async move {
+        next_text(&mut ws, &log, true).await;
+        book_then_changes(&mut ws, 40, Duration::from_millis(5)).await;
+        idle(ws, log).await;
+    })
+    .await;
+    // No PING during the test: the ping arm also catches up, and would
+    // hide a tick arm that does not.
+    let mut cfg = fast_cfg(url);
+    cfg.ping_interval = Duration::from_secs(10);
+    let (out, rx) = writer::test_channel(1);
+    let h = start_with_out(cfg, &["A"], out);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    h.ticks.send(Utc::now()).unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (got, drained) = drain(rx);
+    eventually("book, 40 updates, minute snapshot", || got.lock().unwrap().len() == 42).await;
+    assert_eq!(h.get(|s| &s.minute_snapshots), 1);
+    h.finish().await;
+    drained.await.unwrap();
+
+    let msgs = got.lock().unwrap().clone();
+    let r = replay(&msgs);
+    assert_eq!((r.time_reversals, r.updates_without_baseline, r.mismatched), (0, 0, 0), "{r:?}");
+    let minute = msgs
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| matches!(m, OutMsg::Snapshot(_)))
+        .map(|(i, _)| i)
+        .nth(1)
+        .expect("a minute snapshot");
+    let t = received_at(&msgs[minute]);
+    assert!(msgs[..minute].iter().all(|m| received_at(m) < t), "{:?}", kinds(&msgs));
+    assert!(msgs[minute + 1..].iter().all(|m| received_at(m) >= t), "{:?}", kinds(&msgs));
+}
+
+#[tokio::test]
+async fn frames_read_before_the_socket_drops_are_all_written() {
+    let (url, _log) = mock_server(|n, mut ws, log| async move {
+        next_text(&mut ws, &log, true).await;
+        if n == 0 {
+            book_then_changes(&mut ws, 20, Duration::ZERO).await;
+            // Let the client read them. The client's PING is still unread
+            // here, so the drop is a TCP reset, which discards whatever the
+            // client has not read from its socket yet.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            return; // drops the TCP stream without a Close
+        }
+        idle(ws, log).await;
+    })
+    .await;
+    let (out, rx) = writer::test_channel(1);
+    let h = start_with_out(fast_cfg(url), &["A"], out);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (got, drained) = drain(rx);
+    eventually("all 21 messages", || got.lock().unwrap().len() >= 21).await;
+    h.finish().await;
+    drained.await.unwrap();
+    let mut want = vec!["S:A".to_string()];
+    want.extend((16..36).map(|q| format!("U:A:{q}000000")));
+    assert_eq!(kinds(&got.lock().unwrap()), want);
+}
+
+#[tokio::test]
+async fn shutdown_writes_frames_already_read() {
+    let (url, _log) = mock_server(|_, mut ws, log| async move {
+        next_text(&mut ws, &log, true).await;
+        book_then_changes(&mut ws, 10, Duration::ZERO).await;
+        idle(ws, log).await;
+    })
+    .await;
+    let (out, rx) = writer::test_channel(1);
+    let h = start_with_out(fast_cfg(url), &["A"], out);
+    // All read while the writer is full. (`max_queued_frames` is sampled
+    // only when the session takes a frame, and it is stuck on the second.)
+    eventually("all frames read", || h.get(|s| &s.frames) >= 11).await;
+    h.shutdown.cancel();
+    let (got, drained) = drain(rx);
+    h.finish().await;
+    drained.await.unwrap();
+    assert_eq!(got.lock().unwrap().len(), 11, "{:?}", kinds(&got.lock().unwrap()));
 }

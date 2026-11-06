@@ -135,6 +135,14 @@ impl OutSender {
     }
 }
 
+/// An [`OutSender`] whose receiver the test drains by hand.
+#[cfg(test)]
+pub(crate) fn test_channel(capacity: usize) -> (OutSender, Receiver<OutMsg>) {
+    let (tx, rx) = mpsc::channel(capacity);
+    let stats = Arc::new(WriterStats::default());
+    (OutSender { tx, stats }, rx)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WriterSummary {
     pub snapshots: u64,
