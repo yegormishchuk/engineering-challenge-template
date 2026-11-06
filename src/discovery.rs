@@ -95,9 +95,17 @@ pub const RECENT_QUERIES: [RecentQuery; 3] = [
     RecentQuery { name: "updated", closed: false, field: "updatedAt" },
 ];
 
-/// Parses one legacy `/markets` page (a bare array). Returns the markets and
-/// the oldest `field` timestamp on the page.
-pub fn parse_recent_page(body: &str, field: &str) -> anyhow::Result<(Vec<MarketObs>, Option<DateTime<Utc>>)> {
+/// One parsed legacy `/markets` page.
+pub struct RecentPage {
+    pub markets: Vec<MarketObs>,
+    /// The oldest `field` timestamp on the page.
+    pub oldest: Option<DateTime<Utc>>,
+    /// Entries on the page, including ones that did not parse as markets.
+    pub len: usize,
+}
+
+/// Parses one legacy `/markets` page (a bare array).
+pub fn parse_recent_page(body: &str, field: &str) -> anyhow::Result<RecentPage> {
     let page: Value = serde_json::from_str(body).context("market page is not JSON")?;
     let Some(markets) = page.as_array() else {
         bail!("market page is not an array");
@@ -106,7 +114,11 @@ pub fn parse_recent_page(body: &str, field: &str) -> anyhow::Result<(Vec<MarketO
         .iter()
         .filter_map(|m| m[field].as_str().and_then(parse_gamma_time))
         .min();
-    Ok((markets.iter().filter_map(parse_market).collect(), oldest))
+    Ok(RecentPage {
+        markets: markets.iter().filter_map(parse_market).collect(),
+        oldest,
+        len: markets.len(),
+    })
 }
 
 async fn get_text(http: &reqwest::Client, url: &str) -> anyhow::Result<String> {
@@ -139,8 +151,8 @@ pub fn parse_events_page(body: &str) -> anyhow::Result<(Vec<MarketObs>, Option<S
 }
 
 /// Every open market (or up to `max_pages` pages), read through
-/// `/events/keyset`: about 1400 markets per page, versus 100 per page from
-/// `/markets/keyset`. Each page is also sent on `pages` as it arrives, so
+/// `/events/keyset`: 100 events (`limit` is capped at 100), about 900–1400
+/// markets per page, versus 100 per page from `/markets/keyset`. Each page is also sent on `pages` as it arrives, so
 /// subscriptions start long before a pass that takes minutes is done. Fails
 /// as a whole if any page fails, so a partial pass is never mistaken for the
 /// full set.
@@ -159,10 +171,11 @@ pub async fn fetch_full(
             url.push_str("&after_cursor=");
             url.push_str(c);
         }
+        let observed_at = Utc::now();
         let (markets, next) = parse_events_page(&get_text(http, &url).await?)?;
         // A page is a fresh observation of its markets, like a recent poll.
         pages
-            .send(Poll::Recent { query: "full-page", markets: markets.clone() })
+            .send(Poll::Recent { query: "full-page", observed_at, markets: markets.clone() })
             .await
             .context("poll receiver gone")?;
         out.extend(markets);
@@ -194,10 +207,12 @@ pub async fn fetch_recent(
             page * PAGE
         );
         let body = get_text(http, &url).await?;
-        let (markets, oldest) = parse_recent_page(&body, query.field)?;
-        let short = markets.len() < PAGE;
-        out.extend(markets);
-        if short || oldest.is_none_or(|t| t < since) {
+        let page_data = parse_recent_page(&body, query.field)?;
+        // Short before filtering: an entry that is not a market must not end
+        // the paging early.
+        let short = page_data.len < PAGE;
+        out.extend(page_data.markets);
+        if short || page_data.oldest.is_none_or(|t| t < since) {
             break;
         }
         if page + 1 == max_pages {
@@ -212,8 +227,9 @@ pub async fn fetch_recent(
 pub enum Poll {
     /// Every open market; authoritative for markets unchanged since `started_at`.
     Full { started_at: DateTime<Utc>, markets: Vec<MarketObs> },
-    /// Some markets, fresh; applied as observed.
-    Recent { query: &'static str, markets: Vec<MarketObs> },
+    /// Some markets, applied as observed, except markets changed at or after
+    /// `observed_at` (when the fetch began): the response may predate them.
+    Recent { query: &'static str, observed_at: DateTime<Utc>, markets: Vec<MarketObs> },
 }
 
 #[derive(Debug, Clone)]
@@ -248,9 +264,9 @@ impl Default for PollerConfig {
 }
 
 /// Runs full passes and incremental polls until `shutdown`, sending results
-/// on `tx`. The first full pass is retried until it succeeds; incremental
-/// polls start once it has. Full passes run in their own task, so a slow pass
-/// does not delay incremental polls.
+/// on `tx`. A failed full pass is retried after `retry_after`. Incremental
+/// polls start at once, alongside the first pass. Full passes run in their
+/// own task, so a slow pass does not delay incremental polls.
 pub async fn run_poller(
     http: reqwest::Client,
     cfg: PollerConfig,
@@ -302,13 +318,14 @@ pub async fn run_poller(
         let run_started = Utc::now();
         let mut all_ok = true;
         for query in RECENT_QUERIES {
+            let observed_at = Utc::now();
             let result = tokio::select! {
                 _ = shutdown.cancelled() => break,
                 r = fetch_recent(&http, &cfg.base_url, query, since, cfg.recent_max_pages) => r,
             };
             match result {
                 Ok(markets) => {
-                    if tx.send(Poll::Recent { query: query.name, markets }).await.is_err() {
+                    if tx.send(Poll::Recent { query: query.name, observed_at, markets }).await.is_err() {
                         full.abort();
                         return;
                     }
@@ -371,6 +388,8 @@ pub struct Tracker {
     tracked: HashMap<String, Vec<String>>,
     /// Last add or remove time per market, tracked or not.
     changed_at: HashMap<String, DateTime<Utc>>,
+    /// When `changed_at` was last pruned of entries older than `memory`.
+    pruned_at: Option<DateTime<Utc>>,
 }
 
 impl Tracker {
@@ -413,15 +432,27 @@ impl Tracker {
     }
 
     pub fn apply(&mut self, poll: Poll, now: DateTime<Utc>) -> Diff {
+        // On every poll, not only full passes: if full passes keep failing,
+        // incremental polls would otherwise grow `changed_at` for good.
+        if self.pruned_at.is_none_or(|p| now - p >= TimeDelta::minutes(1)) {
+            let horizon = now - self.cfg.memory;
+            self.changed_at.retain(|_, t| *t >= horizon);
+            self.pruned_at = Some(now);
+        }
         match poll {
-            Poll::Recent { markets, .. } => self.apply_recent(markets, now),
+            Poll::Recent { observed_at, markets, .. } => self.apply_recent(observed_at, markets, now),
             Poll::Full { started_at, markets } => self.apply_full(started_at, markets, now),
         }
     }
 
-    fn apply_recent(&mut self, markets: Vec<MarketObs>, now: DateTime<Utc>) -> Diff {
+    fn apply_recent(&mut self, observed_at: DateTime<Utc>, markets: Vec<MarketObs>, now: DateTime<Utc>) -> Diff {
         let mut diff = Diff::default();
         for m in markets {
+            // Changed (by an event or another poll) after this response was
+            // requested: the response may not reflect it.
+            if self.changed_at.get(&m.condition_id).is_some_and(|&c| c >= observed_at) {
+                continue;
+            }
             if m.tradable {
                 self.add(&m.condition_id, &m.tokens, now, &mut diff);
             } else {
@@ -432,8 +463,6 @@ impl Tracker {
     }
 
     fn apply_full(&mut self, started_at: DateTime<Utc>, markets: Vec<MarketObs>, now: DateTime<Utc>) -> Diff {
-        self.changed_at
-            .retain(|_, t| *t >= now - self.cfg.memory);
         // Anything changed since the pass began is newer than the pass.
         let newer = |t: &HashMap<String, DateTime<Utc>>, id: &str| t.get(id).is_some_and(|&c| c >= started_at);
 
@@ -517,8 +546,17 @@ mod tests {
         }
     }
 
+    /// An observation newer than every change.
     fn recent(markets: Vec<MarketObs>) -> Poll {
-        Poll::Recent { query: "test", markets }
+        recent_at(DateTime::<Utc>::MAX_UTC, markets)
+    }
+
+    fn recent_at(observed_at: DateTime<Utc>, markets: Vec<MarketObs>) -> Poll {
+        Poll::Recent {
+            query: "test",
+            observed_at,
+            markets,
+        }
     }
 
     fn tracker() -> Tracker {
@@ -602,10 +640,13 @@ mod tests {
             {"conditionId":"b","closedTime":"2026-11-04 21:30:00+00","closed":true,"clobTokenIds":"[\"2\"]"},
             {"conditionId":"c","closedTime":null,"closed":true,"clobTokenIds":"[\"3\"]"}
         ]"#;
-        let (markets, oldest) = parse_recent_page(body, "closedTime").unwrap();
-        assert_eq!(markets.len(), 3);
-        assert!(markets.iter().all(|m| !m.tradable));
-        assert_eq!(oldest, Some(t("2026-11-04T21:30:00Z")));
+        let page = parse_recent_page(body, "closedTime").unwrap();
+        assert_eq!(page.markets.len(), 3);
+        assert!(page.markets.iter().all(|m| !m.tradable));
+        assert_eq!(page.oldest, Some(t("2026-11-04T21:30:00Z")));
+        let with_junk = r#"[{"conditionId":"a","clobTokenIds":"[\"1\"]"},{"noConditionId":true}]"#;
+        let page = parse_recent_page(with_junk, "closedTime").unwrap();
+        assert_eq!((page.markets.len(), page.len), (1, 2), "len counts every entry");
     }
 
     #[test]
@@ -669,6 +710,32 @@ mod tests {
         assert_eq!(d.remove, ["a-yes", "a-no"]);
         assert_eq!((d.markets_added, d.markets_removed), (1, 1));
         assert!(tr.apply(recent(vec![obs("b", true)]), t(T2)).is_empty(), "already tracked");
+    }
+
+    #[test]
+    fn an_observation_older_than_a_change_does_not_undo_it() {
+        let mut tr = tracker();
+        tr.apply(full(T0, &["a"]), t(T0));
+        // A page fetched at T1 is applied at T3; meanwhile, at T2, "a"
+        // resolved and "n" was announced.
+        tr.market_resolved("a", t(T2));
+        tr.market_added("n", &["n".into()], t(T2));
+        let d = tr.apply(recent_at(t(T1), vec![obs("a", true), obs("n", false)]), t(T3));
+        assert!(d.is_empty(), "{d:?}");
+        assert!(!tr.is_tracked("a") && tr.is_tracked("n"));
+        // An observation made after the change applies.
+        let d = tr.apply(recent_at(t(T3), vec![obs("a", true)]), t(T3));
+        assert_eq!(d.add, ["a-yes", "a-no"]);
+    }
+
+    #[test]
+    fn change_times_are_forgotten_even_without_full_passes() {
+        let mut tr = tracker();
+        tr.apply(recent(vec![obs("x", false), obs("y", false)]), t(T0));
+        assert_eq!(tr.changed_at.len(), 2);
+        let later = t(T0) + TimeDelta::hours(3);
+        tr.apply(recent(vec![]), later);
+        assert!(tr.changed_at.is_empty());
     }
 
     #[test]

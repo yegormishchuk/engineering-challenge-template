@@ -43,17 +43,17 @@ struct Args {
     #[arg(long)]
     max_markets: Option<usize>,
 
-    /// Read at most this many Gamma event pages (~1400 markets each) per full pass
+    /// Read at most this many Gamma event pages (~900–1400 markets each) per full pass
     /// (for testing). Default: all.
     #[arg(long)]
     max_pages: Option<usize>,
 
     /// Minutes between full discovery passes.
-    #[arg(long, default_value_t = 30)]
+    #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
     full_every_mins: u64,
 
     /// Seconds between incremental discovery polls.
-    #[arg(long, default_value_t = 30)]
+    #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
     recent_every_secs: u64,
 
     /// Writer channel capacity, in messages.
@@ -69,7 +69,7 @@ struct Args {
     verify_rate: f64,
 
     /// Seconds between counter logs.
-    #[arg(long, default_value_t = 30)]
+    #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
     stats_every: u64,
 }
 

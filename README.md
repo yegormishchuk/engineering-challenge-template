@@ -94,7 +94,7 @@ validates. `scripts/summarize.py ~/runs/<name>.log` summarizes the log.
 | `--output <path>` | `-` | `-` or `/dev/stdout` = stdout; otherwise a file (truncated) |
 | `--max-per-connection <n>` | 5000 | Most tokens per websocket |
 | `--max-markets <n>` | all | Track at most n markets (testing) |
-| `--max-pages <n>` | all | Read at most n Gamma event pages (~1400 markets each) per full pass (testing) |
+| `--max-pages <n>` | all | Read at most n Gamma event pages (~900–1400 markets each) per full pass (testing) |
 | `--full-every-mins <n>` | 30 | Minutes between full discovery passes |
 | `--recent-every-secs <n>` | 30 | Seconds between incremental discovery polls |
 | `--channel-capacity <n>` | 65536 | Writer queue, in messages |
