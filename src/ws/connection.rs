@@ -157,6 +157,8 @@ pub struct ConnectionConfig {
     /// time, not read time, so a lagging reader cannot trigger it early.
     pub empty_book_on_change_after: Duration,
     pub verify: Option<VerifyConfig>,
+    /// How often a redundant member checks for lost messages and lag.
+    pub shard_check_every: Duration,
 }
 
 impl Default for ConnectionConfig {
@@ -176,6 +178,7 @@ impl Default for ConnectionConfig {
             empty_book_after: Duration::from_secs(5),
             empty_book_on_change_after: Duration::from_millis(1500),
             verify: None,
+            shard_check_every: Duration::from_millis(500),
         }
     }
 }
@@ -267,6 +270,8 @@ pub struct Connection {
     member: Option<Member>,
     /// The shard's switch epoch this connection last wrote under.
     seen_epoch: u64,
+    /// Receive instant of the frame being handled, for hash tracking.
+    frame_at: std::time::Instant,
     cfg: ConnectionConfig,
     /// In the order they were added, so a market's tokens (added together)
     /// stay in the same subscription batch after a reconnect.
@@ -291,9 +296,11 @@ pub struct Connection {
     /// can share an `Instant`). The next number to use; never reset.
     next_ping: u64,
     /// Numbers of `PING`s not yet answered, oldest first.
-    pings: VecDeque<u64>,
+    pings: VecDeque<(u64, std::time::Instant)>,
     /// Number of the newest `PING` answered by a `PONG`.
     acked_through: Option<u64>,
+    /// When the newest answered `PING` was sent.
+    acked_sent_at: Option<std::time::Instant>,
     /// Symbols unsubscribed for a resync, with the number of the `PING` that
     /// followed the unsubscribe. Until that `PING` is answered, data for them
     /// may still be from before the unsubscribe, so it is dropped; the new
@@ -352,6 +359,7 @@ impl Connection {
             id,
             member: None,
             seen_epoch: 0,
+            frame_at: std::time::Instant::now(),
             cfg,
             symbols: IndexSet::new(),
             books: Books::new(),
@@ -365,6 +373,7 @@ impl Connection {
             next_ping: 0,
             pings: VecDeque::new(),
             acked_through: None,
+            acked_sent_at: None,
             resyncing: HashMap::new(),
             assumed: HashSet::new(),
             to_verify: Vec::new(),
@@ -389,7 +398,12 @@ impl Connection {
     /// while holding the guard (no guard without a shard). A connection that
     /// has just become the source first writes a snapshot of every symbol
     /// with a live book.
-    async fn begin_output(&mut self) -> Result<Option<Option<OwnedMutexGuard<SourceState>>>, WriterGone> {
+    ///
+    /// `at` stamps the switch snapshot (before the floor, see [`Self::write`]).
+    async fn begin_output(
+        &mut self,
+        at: DateTime<Utc>,
+    ) -> Result<Option<Option<OwnedMutexGuard<SourceState>>>, WriterGone> {
         let Some(member) = &self.member else {
             return Ok(Some(None));
         };
@@ -401,8 +415,8 @@ impl Connection {
         if st.epoch != self.seen_epoch {
             self.seen_epoch = st.epoch;
             let mut written = 0;
-            for msg in self.books.minute_snapshots(Utc::now()) {
-                self.out.send(msg).await?;
+            for msg in self.books.minute_snapshots(at) {
+                self.write(Some(&mut st), msg).await?;
                 written += 1;
             }
             add(&self.stats.switch_snapshots, written);
@@ -411,12 +425,70 @@ impl Connection {
         Ok(Some(Some(st)))
     }
 
+    /// Sends one message. As a shard member (holding the lock), raises its
+    /// receive time to the floor set at the last switch and records it.
+    async fn write(&self, st: Option<&mut SourceState>, mut msg: OutMsg) -> Result<(), WriterGone> {
+        if let Some(st) = st {
+            let t = match &mut msg {
+                OutMsg::Snapshot(s) => &mut s.received_at,
+                OutMsg::Update(u) => &mut u.backtest_timestamp,
+            };
+            if let Some(floor) = st.floor {
+                *t = (*t).max(floor);
+            }
+            st.last_written = Some(st.last_written.map_or(*t, |l| l.max(*t)));
+        }
+        self.out.send(msg).await
+    }
+
     /// Writes one message if this connection is its shard's source.
     async fn emit(&mut self, msg: OutMsg) -> Result<(), WriterGone> {
-        let Some(_guard) = self.begin_output().await? else {
+        let at = match &msg {
+            OutMsg::Snapshot(s) => s.received_at,
+            OutMsg::Update(u) => u.backtest_timestamp,
+        };
+        let Some(mut guard) = self.begin_output(at).await? else {
             return Ok(());
         };
-        self.out.send(msg).await
+        self.write(guard.as_deref_mut(), msg).await
+    }
+
+    /// Records an applied hash with the shard (redundant members only).
+    fn observe(&self, symbol: &str, hash: Option<&str>, lag_sample: bool) {
+        if let (Some(m), Some(hash)) = (&self.member, hash) {
+            m.shard.observe(m.index, symbol, hash, self.frame_at, lag_sample);
+        }
+    }
+
+    /// Resyncs symbols a peer received changes for that this connection
+    /// missed, and lets the shard hand over if this is a lagging or lossy
+    /// source.
+    async fn check_shard(&mut self, ws: &mut Ws) -> Result<(), Stop> {
+        let Some(m) = self.member.clone() else {
+            return Ok(());
+        };
+        // Keep a recent barrier: loss is judged against the last answered
+        // PING (see `ShardSource::check_lost`).
+        if self.pings.is_empty() {
+            self.send_ping(ws).await.map_err(Stop::Lost)?;
+        }
+        let Some(cutoff) = self.acked_sent_at else {
+            return Ok(());
+        };
+        let lost = m.shard.check_lost(m.index, cutoff, |s| self.books.live_since(s));
+        m.shard
+            .review(m.index, std::time::Instant::now(), !lost.is_empty())
+            .await;
+        if !lost.is_empty() {
+            warn!(
+                conn = self.id,
+                symbols = lost.len(),
+                first = %lost[0],
+                "a peer received changes this connection did not; resyncing them"
+            );
+            self.resync(ws, &lost).await?;
+        }
+        Ok(())
     }
 
     fn report_baselines(&self) {
@@ -537,7 +609,7 @@ impl Connection {
         self.ws_send(ws, polymarket::PING.to_owned()).await?;
         let n = self.next_ping;
         self.next_ping += 1;
-        self.pings.push_back(n);
+        self.pings.push_back((n, std::time::Instant::now()));
         Ok(n)
     }
 
@@ -559,6 +631,7 @@ impl Connection {
         self.awaiting_book.clear();
         self.pings.clear();
         self.acked_through = None;
+        self.acked_sent_at = None;
         // Everything is resubscribed from scratch; old guesses are stale.
         self.resyncing.clear();
         self.assumed.clear();
@@ -584,6 +657,8 @@ impl Connection {
         // Results of REST checks started in this session.
         let (verified_tx, mut verified_rx) = mpsc::unbounded_channel::<Verified>();
         let mut verify_in_flight = false;
+        let mut shard_check = tokio::time::interval(self.cfg.shard_check_every);
+        shard_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             tokio::select! {
@@ -606,10 +681,11 @@ impl Connection {
                     inc(&self.stats.frames);
                     add(&self.stats.bytes, text.len());
                     let busy = std::time::Instant::now();
+                    self.frame_at = busy;
                     // Settle who writes before applying the frame, so a
                     // switch snapshot shows the books as they were before it.
                     if self.member.is_some() {
-                        drop(self.begin_output().await?);
+                        drop(self.begin_output(received_at).await?);
                     }
                     let result = self.on_text(&mut ws, &text, received_at, &mut last_pong).await;
                     self.report_baselines();
@@ -617,6 +693,13 @@ impl Connection {
                     self.stats.busy_us.fetch_add(us, Ordering::Relaxed);
                     self.stats.max_frame_us.fetch_max(us, Ordering::Relaxed);
                     match result {
+                        Ok(()) => {}
+                        Err(Stop::Lost(reason)) => return Ok(SessionEnd::Lost(reason)),
+                        Err(Stop::WriterGone) => return Err(WriterGone),
+                    }
+                }
+                _ = shard_check.tick(), if self.member.is_some() => {
+                    match self.check_shard(&mut ws).await {
                         Ok(()) => {}
                         Err(Stop::Lost(reason)) => return Ok(SessionEnd::Lost(reason)),
                         Err(Stop::WriterGone) => return Err(WriterGone),
@@ -692,10 +775,10 @@ impl Connection {
                         self.ticks_open = false;
                         continue;
                     }
-                    if let Some(_guard) = self.begin_output().await? {
-                        let emitted_at = Utc::now();
+                    let emitted_at = Utc::now();
+                    if let Some(mut guard) = self.begin_output(emitted_at).await? {
                         for msg in self.books.minute_snapshots(emitted_at) {
-                            self.out.send(msg).await?;
+                            self.write(guard.as_deref_mut(), msg).await?;
                             inc(&self.stats.minute_snapshots);
                         }
                     }
@@ -764,7 +847,7 @@ impl Connection {
                 bids,
                 asks,
                 exchange_ts,
-                ..
+                hash,
             } => {
                 if !self.symbols.contains(&symbol) {
                     return Ok(()); // late message for a removed symbol
@@ -782,6 +865,7 @@ impl Connection {
                 match self.books.apply_snapshot(&symbol, bids, asks, exchange_ts, received_at) {
                     Ok(applied) => {
                         inc(&self.stats.books);
+                        self.observe(&symbol, hash.as_deref(), false);
                         self.note_mismatches(&symbol, &applied);
                         self.emit(applied.msg).await?;
                     }
@@ -797,7 +881,7 @@ impl Connection {
                 price,
                 quantity,
                 exchange_ts,
-                ..
+                hash,
             } => {
                 if !self.symbols.contains(&symbol) {
                     return Ok(());
@@ -824,6 +908,7 @@ impl Connection {
                 match self.books.apply_level(&symbol, side, price, quantity, exchange_ts, received_at) {
                     Ok(msg) => {
                         inc(&self.stats.levels);
+                        self.observe(&symbol, hash.as_deref(), true);
                         self.emit(msg).await?;
                     }
                     Err(BooksError::NoBaseline { .. }) => inc(&self.stats.skipped_no_baseline),
@@ -835,8 +920,9 @@ impl Connection {
             }
             Event::Pong => {
                 *last_pong = Instant::now();
-                if let Some(acked) = self.pings.pop_front() {
+                if let Some((acked, sent_at)) = self.pings.pop_front() {
                     self.acked_through = Some(acked);
+                    self.acked_sent_at = Some(sent_at);
                     // Resyncs and removals whose old data has now all been read.
                     self.resyncing.retain(|_, barrier| *barrier > acked);
                     self.recently_removed.retain(|_, barrier| *barrier > acked);

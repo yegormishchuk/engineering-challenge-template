@@ -39,6 +39,7 @@ fn fast_cfg(url: String) -> ConnectionConfig {
         empty_book_after: Duration::from_secs(60),
         empty_book_on_change_after: Duration::from_secs(60),
         verify: None,
+        shard_check_every: Duration::from_millis(20),
     }
 }
 
@@ -989,12 +990,20 @@ struct ShardHarness {
 }
 
 fn start_shard(cfgs: Vec<ConnectionConfig>, symbols: &[&str]) -> ShardHarness {
+    start_shard_with(cfgs, symbols, crate::ws::source::DetectConfig::default())
+}
+
+fn start_shard_with(
+    cfgs: Vec<ConnectionConfig>,
+    symbols: &[&str],
+    detect: crate::ws::source::DetectConfig,
+) -> ShardHarness {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("out.sbe");
     let (out, writer) = writer::spawn(&Output::File(path.clone()), 1024).unwrap();
     let (ticks, tick_rx) = watch::channel(Utc::now());
     let shutdown = CancellationToken::new();
-    let shard = Arc::new(ShardSource::new(0, cfgs.len()));
+    let shard = Arc::new(ShardSource::new(0, cfgs.len()).with_detect(detect));
     let (mut cmds, mut stats, mut tasks) = (Vec::new(), Vec::new(), Vec::new());
     for (index, cfg) in cfgs.into_iter().enumerate() {
         let s = Arc::new(ConnStats::default());
@@ -1165,4 +1174,148 @@ async fn a_dropped_source_hands_over_with_a_snapshot_and_no_gap() {
     let r = replay(&msgs);
     assert!(r.file_is_consistent(), "{r:?}");
     assert_eq!((r.updates_without_baseline, r.mismatched), (0, 0), "{r:?}");
+}
+
+/// A change for A setting the 0.40 bid to `size`, with its own hash.
+fn change_a_hashed(size: &str, ms: i64, hash: &str) -> String {
+    change_a(size, ms).replace("\"hash\":\"h2\"", &format!("\"hash\":\"{hash}\""))
+}
+
+/// The bid quantity at 0.40 in the last snapshot of A.
+fn last_a_bid(msgs: &[OutMsg]) -> i64 {
+    msgs.iter()
+        .rev()
+        .find_map(|m| match m {
+            OutMsg::Snapshot(s) if s.symbol == "A" => Some(s.bids[0].quantity),
+            _ => None,
+        })
+        .unwrap()
+}
+
+/// Two members whose servers send BOOK_A and then `script` (server index,
+/// websocket); member 1's server waits until member 0 is connected, so
+/// member 0 is the source.
+async fn two_member_shard<F, Fut>(detect: crate::ws::source::DetectConfig, script: F) -> (ShardHarness, Arc<tokio::sync::Notify>)
+where
+    F: Fn(usize, ServerWs, Arc<Mutex<Vec<String>>>) -> Fut + Send + Sync + Clone + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let peer_start = Arc::new(tokio::sync::Notify::new());
+    let mut urls = Vec::new();
+    for server in 0..2 {
+        let (script, peer_start) = (script.clone(), Arc::clone(&peer_start));
+        let (url, _) = mock_server(move |n, mut ws, log| {
+            let (script, peer_start) = (script.clone(), Arc::clone(&peer_start));
+            async move {
+                next_text(&mut ws, &log, true).await;
+                if n > 0 {
+                    return idle(ws, log).await;
+                }
+                if server == 1 {
+                    tokio::select! {
+                        _ = peer_start.notified() => {}
+                        _ = answer_for(&mut ws, &log, Duration::from_secs(5)) => {}
+                    }
+                }
+                send(&mut ws, BOOK_A).await;
+                script(server, ws, log).await;
+            }
+        })
+        .await;
+        urls.push(url);
+    }
+    let h = start_shard_with(urls.into_iter().map(fast_cfg).collect(), &["A"], detect);
+    eventually("member 0 connected", || h.get(0, |s| &s.connects) == 1).await;
+    peer_start.notify_one();
+    eventually("both have the book", || h.get(0, |s| &s.books) == 1 && h.get(1, |s| &s.books) == 1).await;
+    (h, peer_start)
+}
+
+#[tokio::test]
+async fn a_change_the_source_missed_switches_and_resyncs_it() {
+    let detect = crate::ws::source::DetectConfig {
+        loss_after: Duration::from_millis(300),
+        hold: Duration::ZERO,
+        ..Default::default()
+    };
+    let (h, _) = two_member_shard(detect, |server, mut ws, log| async move {
+        send(&mut ws, &change_a_hashed("15", 1793822781001, "x1")).await;
+        if server == 1 {
+            // Only the peer gets this one.
+            send(&mut ws, &change_a_hashed("30", 1793822781500, "x2")).await;
+        }
+        idle(ws, log).await;
+    })
+    .await;
+    eventually("lost change detected and handed over", || h.switches() == 1).await;
+    assert_eq!(h.shard.lock().await.source, 1);
+    eventually("old source resyncs A", || h.get(0, |s| &s.resyncs) == 1).await;
+    assert_eq!(h.shard.lost_on_source.load(Ordering::Relaxed), 1);
+    // The new source writes its books (A at 30) at its next output.
+    h.ticks.send(Utc::now()).unwrap();
+    eventually("switch snapshot", || h.get(1, |s| &s.switch_snapshots) == 1).await;
+    let msgs = h.finish().await;
+    assert_eq!(last_a_bid(&msgs), 30_000_000, "{:?}", kinds(&msgs));
+    let r = replay(&msgs);
+    assert!(r.file_is_consistent(), "{r:?}");
+    assert_eq!(r.updates_without_baseline, 0);
+}
+
+#[tokio::test]
+async fn a_lagging_source_hands_over_to_a_faster_peer() {
+    let detect = crate::ws::source::DetectConfig {
+        min_lag_samples: 5,
+        hold: Duration::ZERO,
+        ..Default::default()
+    };
+    let (h, _) = two_member_shard(detect, |server, mut ws, log| async move {
+        // The source's server (0) delivers every change 500 ms after the peer's.
+        if server == 0 {
+            answer_for(&mut ws, &log, Duration::from_millis(500)).await;
+        }
+        for i in 0..8 {
+            send(&mut ws, &change_a_hashed(&(20 + i).to_string(), 1793822782000 + i, &format!("l{i}"))).await;
+            answer_for(&mut ws, &log, Duration::from_millis(30)).await;
+        }
+        idle(ws, log).await;
+    })
+    .await;
+    eventually("lag detected", || h.switches() == 1).await;
+    assert_eq!(h.shard.lock().await.source, 1);
+    let (p50, _, _) = h.shard.lag_stats(std::time::Instant::now()).unwrap_or((0.0, 0.0, 0));
+    assert!(p50 < 200.0, "samples after the switch are against the new source: {p50}");
+    assert_eq!(h.shard.lost_on_source.load(Ordering::Relaxed), 0, "late is not lost");
+    let msgs = h.finish().await;
+    let r = replay(&msgs);
+    assert!(r.file_is_consistent(), "{r:?}");
+    assert_eq!(r.updates_without_baseline, 0);
+}
+
+#[tokio::test]
+async fn a_slow_reader_is_not_taken_for_a_lost_message() {
+    let detect = crate::ws::source::DetectConfig {
+        loss_after: Duration::from_millis(300),
+        hold: Duration::ZERO,
+        ..Default::default()
+    };
+    let (h, _) = two_member_shard(detect, |server, mut ws, log| async move {
+        if server == 1 {
+            send(&mut ws, &change_a_hashed("30", 1793822781500, "s1")).await;
+            return idle(ws, log).await;
+        }
+        // Member 0 reads the change 1 s late, like a backlogged reader: after
+        // a moment of normal PONGs (so it has a barrier), its PINGs are
+        // answered only after the change.
+        answer_for(&mut ws, &log, Duration::from_millis(150)).await;
+        let owed = ignore_pings_for(&mut ws, &log, Duration::from_secs(1)).await;
+        send(&mut ws, &change_a_hashed("30", 1793822781500, "s1")).await;
+        pong_owed(&mut ws, owed).await;
+        idle(ws, log).await;
+    })
+    .await;
+    eventually("member 0 got the change", || h.get(0, |s| &s.levels) == 1).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(h.shard.lost_on_source.load(Ordering::Relaxed), 0);
+    assert_eq!((h.switches(), h.get(0, |s| &s.resyncs)), (0, 0));
+    h.finish().await;
 }

@@ -15,6 +15,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::time::Instant;
 
 use chrono::{DateTime, Utc};
 
@@ -53,9 +54,17 @@ pub struct SnapshotApplied {
     pub after_gap: bool,
 }
 
+#[derive(Debug)]
+struct Entry {
+    book: OrderBook,
+    /// When the book last became a baseline (first book, or first book
+    /// after a gap). Changes sent before then were never seen by this book.
+    live_since: Instant,
+}
+
 #[derive(Debug, Default)]
 pub struct Books {
-    books: HashMap<String, OrderBook>,
+    books: HashMap<String, Entry>,
     stale: HashSet<String>,
 }
 
@@ -73,7 +82,15 @@ impl Books {
     }
 
     pub fn get(&self, symbol: &str) -> Option<&OrderBook> {
-        self.books.get(symbol)
+        self.books.get(symbol).map(|e| &e.book)
+    }
+
+    /// When the symbol's book became a baseline; `None` if it is not one.
+    pub fn live_since(&self, symbol: &str) -> Option<Instant> {
+        if self.stale.contains(symbol) {
+            return None;
+        }
+        self.books.get(symbol).map(|e| e.live_since)
     }
 
     /// Books that are baselines (not stale).
@@ -118,19 +135,29 @@ impl Books {
             error,
         };
         let mismatches = match self.books.get_mut(symbol) {
-            Some(book) => Some(
-                book.check_and_replace(bids, asks, exchange_ts)
+            Some(entry) => Some(
+                entry
+                    .book
+                    .check_and_replace(bids, asks, exchange_ts)
                     .map_err(book_err)?,
             ),
             None => {
                 let mut book = OrderBook::new();
                 book.replace(bids, asks, exchange_ts).map_err(book_err)?;
-                self.books.insert(symbol.to_owned(), book);
+                let entry = Entry {
+                    book,
+                    live_since: Instant::now(),
+                };
+                self.books.insert(symbol.to_owned(), entry);
                 None
             }
         };
         let after_gap = self.stale.remove(symbol);
-        let book = &self.books[symbol];
+        let entry = self.books.get_mut(symbol).expect("inserted above");
+        if after_gap {
+            entry.live_since = Instant::now();
+        }
+        let book = &entry.book;
         Ok(SnapshotApplied {
             msg: OutMsg::Snapshot(book.snapshot(symbol, received_at, exchange_ts)),
             mismatches,
@@ -155,8 +182,10 @@ impl Books {
         if self.stale.contains(symbol) {
             return Err(no_baseline());
         }
-        let book = self.books.get_mut(symbol).ok_or_else(no_baseline)?;
-        book.set_level(side, price, quantity, exchange_ts)
+        let entry = self.books.get_mut(symbol).ok_or_else(no_baseline)?;
+        entry
+            .book
+            .set_level(side, price, quantity, exchange_ts)
             .map_err(|error| BooksError::Book {
                 symbol: symbol.to_owned(),
                 error,
@@ -183,7 +212,7 @@ impl Books {
             .collect();
         symbols.sort_unstable();
         symbols.into_iter().map(move |symbol| {
-            let book = &self.books[symbol];
+            let book = &self.books[symbol].book;
             let exchange_ts = book.last_exchange_ts().unwrap_or(emitted_at);
             OutMsg::Snapshot(book.snapshot(symbol, emitted_at, exchange_ts))
         })
@@ -297,6 +326,21 @@ mod tests {
         let live = books.apply_snapshot("T", [(100, 1)], [], ts(5), ts(5)).unwrap();
         assert!(!live.after_gap, "only the first book after the gap");
         assert_eq!(books.minute_snapshots(ts(6)).count(), 2);
+    }
+
+    #[test]
+    fn live_since_restarts_after_a_gap() {
+        let mut books = Books::new();
+        assert_eq!(books.live_since("T"), None);
+        books.apply_snapshot("T", [], [], ts(1), ts(1)).unwrap();
+        let first = books.live_since("T").unwrap();
+        books.apply_snapshot("T", [], [], ts(2), ts(2)).unwrap();
+        assert_eq!(books.live_since("T"), Some(first), "a live book stays live");
+        books.mark_stale("T");
+        assert_eq!(books.live_since("T"), None);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        books.apply_snapshot("T", [], [], ts(3), ts(3)).unwrap();
+        assert!(books.live_since("T").unwrap() > first);
     }
 
     #[test]

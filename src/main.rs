@@ -70,7 +70,9 @@ struct Args {
 
     /// Connections per shard, all subscribed to the same symbols; one writes
     /// at a time and the others take over when it fails (1 = no redundancy).
-    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u64).range(1..=4))]
+    /// Default 1 until hash-based loss detection stops misfiring live (see
+    /// docs/NEXT.md, E1 status).
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..=4))]
     redundancy: u64,
 
     /// Seconds between counter logs.
@@ -251,12 +253,21 @@ fn log_stats(shards: &ShardManager) {
             "connection stats"
         );
     }
+    let now = std::time::Instant::now();
     for src in shards.sources() {
+        let (lag_p50_ms, lag_p99_ms, lag_samples) = src.lag_stats(now).unwrap_or_default();
         info!(
             shard = src.shard,
             // Connection id of the source; absent if the lock was busy.
             source = src.try_source().map(|m| src.shard * src.members() + m),
             source_switches = src.switches.load(Relaxed),
+            lost_on_source = src.lost_on_source.load(Relaxed),
+            lost_on_peers = src.lost_on_peers.load(Relaxed),
+            late_after_loss = src.late_after_loss.load(Relaxed),
+            late_after_loss_max_ms = src.late_after_loss_max_ms.load(Relaxed),
+            lag_p50_ms = lag_p50_ms.round() as i64,
+            lag_p99_ms = lag_p99_ms.round() as i64,
+            lag_samples,
             "shard source"
         );
     }
