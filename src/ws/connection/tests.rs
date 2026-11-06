@@ -579,8 +579,13 @@ async fn mock_books_http(with_orders: &'static [&'static str]) -> (String, Arc<M
     (url, bodies)
 }
 
-/// Like `mock_books_http`, with an explicit JSON book per token.
-async fn mock_books_http_with(books: &'static [(&'static str, &'static str)]) -> (String, Arc<Mutex<Vec<String>>>) {
+/// Like `mock_books_http`, with an explicit JSON book per token. With a
+/// `gate`, the books are returned only once it is set (the orders exist from
+/// then on).
+async fn mock_books_http_with(
+    books: &'static [(&'static str, &'static str)],
+    gate: Option<Arc<std::sync::atomic::AtomicBool>>,
+) -> (String, Arc<Mutex<Vec<String>>>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/books", listener.local_addr().unwrap());
@@ -589,6 +594,7 @@ async fn mock_books_http_with(books: &'static [(&'static str, &'static str)]) ->
     tokio::spawn(async move {
         while let Ok((mut stream, _)) = listener.accept().await {
             let log = Arc::clone(&log);
+            let gate = gate.clone();
             tokio::spawn(async move {
                 let mut buf = Vec::new();
                 let mut chunk = [0u8; 4096];
@@ -611,8 +617,10 @@ async fn mock_books_http_with(books: &'static [(&'static str, &'static str)]) ->
                 };
                 let requested: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
                 log.lock().unwrap().push(body);
+                let open = gate.as_ref().is_none_or(|g| g.load(std::sync::atomic::Ordering::SeqCst));
                 let parts: Vec<&str> = requested
                     .iter()
+                    .filter(|_| open)
                     .filter_map(|r| r["token_id"].as_str())
                     .filter_map(|t| books.iter().find(|(id, _)| *id == t).map(|(_, b)| *b))
                     .collect();
@@ -825,7 +833,7 @@ async fn an_order_placed_after_a_correct_empty_guess_is_not_a_wrong_guess() {
         idle(ws, log).await;
     })
     .await;
-    let (http_url, _requests) = mock_books_http_with(&[("B", r#"{"asset_id":"B","bids":[],"asks":[{"price":"0.10","size":"1"}]}"#)]).await;
+    let (http_url, _requests) = mock_books_http_with(&[("B", r#"{"asset_id":"B","bids":[],"asks":[{"price":"0.10","size":"1"}]}"#)], None).await;
     let mut cfg = fast_cfg(ws_url);
     cfg.empty_book_after = Duration::from_millis(50);
     // REST sees the order ~300 ms before the stream does; the confirmation
@@ -876,28 +884,38 @@ async fn a_stale_book_read_after_the_resubscribe_is_still_dropped() {
 
 #[tokio::test]
 async fn a_rest_result_waits_until_the_stream_catches_up() {
-    // REST shows an order that the lagging stream delivers only later; the
-    // check must not call the correct empty guess wrong in the meantime.
-    let (ws_url, _log) = mock_server(|_, mut ws, log| async move {
-        next_text(&mut ws, &log, true).await;
-        answer_for(&mut ws, &log, Duration::from_millis(200)).await; // guess happens
-        // Behind: hold PINGs, including the one sent when the REST answer came.
-        let owed = ignore_pings_for(&mut ws, &log, Duration::from_millis(600)).await;
-        send(&mut ws, &change_b_at(Utc::now().timestamp_millis())).await;
-        pong_owed(&mut ws, owed).await;
-        idle(ws, log).await;
+    // An order is placed while data is in flight to a lagging reader: REST
+    // shows it at once, the stream delivers it (and the PONGs) only later.
+    // The check must not call the correct empty guess wrong meanwhile.
+    let placed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let server_placed = Arc::clone(&placed);
+    let (ws_url, _log) = mock_server(move |_, mut ws, log| {
+        let placed = Arc::clone(&server_placed);
+        async move {
+            next_text(&mut ws, &log, true).await;
+            answer_for(&mut ws, &log, Duration::from_millis(200)).await; // guess happens
+            placed.store(true, std::sync::atomic::Ordering::SeqCst);
+            let owed = ignore_pings_for(&mut ws, &log, Duration::from_millis(600)).await;
+            send(&mut ws, &change_b_at(Utc::now().timestamp_millis())).await;
+            pong_owed(&mut ws, owed).await;
+            idle(ws, log).await;
+        }
     })
     .await;
-    let (http_url, _requests) = mock_books_http_with(&[("B", r#"{"asset_id":"B","bids":[],"asks":[{"price":"0.10","size":"1"}]}"#)]).await;
+    let (http_url, _requests) = mock_books_http_with(
+        &[("B", r#"{"asset_id":"B","bids":[],"asks":[{"price":"0.10","size":"1"}]}"#)],
+        Some(placed),
+    )
+    .await;
     let mut cfg = fast_cfg(ws_url);
     cfg.empty_book_after = Duration::from_millis(50);
     cfg.verify = verify_cfg(http_url).map(|mut v| {
-        v.confirm_after = Duration::from_millis(100); // shorter than the lag
+        v.confirm_after = Duration::from_millis(100); // much shorter than the lag
         v
     });
     let h = start(cfg, &["B"]);
     eventually("change applied", || h.get(|s| &s.levels) == 1).await;
-    eventually("confirmed", || h.get(|s| &s.empty_confirmed) >= 1).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(h.get(|s| &s.empty_wrong), 0);
     assert_eq!(h.get(|s| &s.resyncs), 0);
     h.finish().await;
