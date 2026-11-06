@@ -560,7 +560,9 @@ impl Connection {
                         m.shard.connected(m.index).await;
                     }
                     inc(&self.stats.connects);
-                    info!(conn = self.id, symbols = self.symbols.len(), "connected");
+                    // The local port identifies the socket (`ss`, packet captures).
+                    let local_port = ws.get_ref().get_ref().local_addr().ok().map(|a| a.port());
+                    info!(conn = self.id, symbols = self.symbols.len(), ?local_port, "connected");
                     let started = Instant::now();
                     let end = self.session(ws, &mut cmds, &mut ticks, &shutdown).await;
                     // The next session starts from fresh exchange books; the

@@ -100,6 +100,7 @@ validates. `scripts/summarize.py ~/runs/<name>.log` summarizes the log.
 | `--channel-capacity <n>` | 65536 | Writer queue, in messages |
 | `--no-verify-empty` | off | Skip REST checks of books assumed empty |
 | `--verify-rate <r>` | 10 | REST checks per second, over all connections |
+| `--redundancy <r>` | 2 | Connections per shard, all subscribed to the same tokens; one writes (1–4; 1 = no redundancy; each member about doubles memory) |
 | `--stats-every <secs>` | 30 | Seconds between counter logs |
 
 ## Output format
@@ -146,7 +147,7 @@ A crash or `kill -9` loses everything since the last full chunk, up to
 64 MiB of messages: the template writer only writes whole 64 MiB chunks, and
 the template reader only reads 64 MiB chunks, so flushing more often would
 mean writing mostly zero padding. Run two instances on separate hosts if a
-crash must not lose data.
+crash must not lose data (see Redundancy).
 
 ## Validating a file
 
@@ -174,7 +175,10 @@ that differs from the locally built one, the collector writes it as is (it is
 the truth from then on) and counts it. So `mismatched` should equal the sum,
 over connections, of `mismatched_books + gap_mismatched_books` from the
 collector's last stats lines. Any extra means the file lost or reordered
-messages. (A token removed and later re-added can add one.)
+messages. (A token removed and later re-added can add one.) With
+`--redundancy` above 1 this holds per source only: a switch snapshot that
+differs from what the old source wrote also counts as `mismatched`, so
+compare with `--redundancy 1` when checking completeness this way.
 
 ## Log counters
 
@@ -202,6 +206,17 @@ Counters are totals since start.
 | `verify_errors` | failed REST check requests (retried with backoff) |
 | `ignored` | messages not recorded (`last_trade_price`, `best_bid_ask`, …) |
 | `busy_ms`, `max_frame_us` | time spent handling frames, total and longest single frame |
+| `switch_snapshots`, `switch_without_baseline` | snapshots this connection wrote on becoming its shard's source; symbols it had no live book for then (nothing is written for them until their next book) |
+| `lock_wait_ms`, `max_lock_wait_us` | time waiting for the shard's output lock, total and longest |
+
+With `--redundancy` above 1, a `shard source` line per shard follows:
+`source` (connection id writing now), `source_switches`, `lost_on_source` /
+`lost_on_peers` (changes a member never received, by hash, see
+Redundancy), `late_after_loss` and `late_after_loss_max_ms` (changes
+declared lost that arrived later after all: should be 0; otherwise the loss
+window is too short), `lag_p50_ms` / `lag_p99_ms` / `lag_samples` (how much
+later the source receives a change than the first member that does, last
+30 s; negative = the source is ahead).
 
 Other lines: `subscriptions changed` (discovery added/removed markets;
 `source` says which layer), `full discovery pass done`, `writer channel full;
@@ -257,6 +272,51 @@ taken before parsing, and no decision depends on how fast frames are read.
 **Memory.** The collector uses jemalloc: glibc malloc fragmented badly
 across tokio's threads (about 7 KB per token against ~2 KB of live data).
 
+**Time stamps.** Each connection's output times never go backwards: the
+WSL2 clock stepped back 386 ms in one run, so a stamp is never earlier than
+the connection's previous one.
+
+## Redundancy
+
+A **shard** is `--redundancy` connections (default 2) subscribed to the
+same tokens, each with its own books. One of them, the **source**, writes;
+the others keep their books current and drop their output. Every write goes
+through a lock shared by the shard, so a switch falls between two messages,
+never inside one.
+
+The source changes when:
+
+- **its connection is lost** (closed, error, or no `PONG` for 30 s): the
+  connected member with the most live books takes over at once; if none is
+  connected, the first member to connect takes over;
+- **it loses a change**: Polymarket attaches a `hash` of the resulting book
+  to every change, and every socket on the same token gets the same hashes
+  (checked live: 61,044 of 61,044 on 6000 tokens). A hash a peer received
+  but the source has not, 30 s later, while the source's book for that
+  token was live, is a lost change: the source hands over and resyncs the
+  token. The wait is long because sockets differ a lot in delivery time
+  (the same change arrived up to 4 s apart between two sockets, one socket
+  stayed 4–17 s behind in collector runs), and `PONG`s are not queued
+  behind changes, so a barrier cannot tell late from lost;
+- **it lags**: if over 30 s the source received changes a median of more
+  than 250 ms after a peer (at least 100 samples), the faster peer takes
+  over.
+
+Apart from a lost connection, there is at most one switch a minute.
+
+On becoming the source, a member first writes a snapshot of every token it
+has a live book for, as its books were before its next frame, then its own
+messages. A reader therefore always has a baseline, and the file replays
+consistently across switches. Receive times after a switch are raised to
+the last one written, so a token's times never go backwards when the new
+source's clock reading of a change is earlier than the old one's.
+
+**Process crashes** are not covered by redundancy inside one process. Run
+two collector instances on separate hosts (or at least separate machines'
+network paths), each writing its own file; if one crashes, the other's file
+is complete. Choosing between them afterwards is a matter of `validate` and
+the counters.
+
 ## Measured limits
 
 Measured live in November 2026.
@@ -286,7 +346,12 @@ Measured live in November 2026.
 - A crash loses up to one 64 MiB chunk (see Shutdown).
 - `--output -` writes through `/dev/stdout`: redirect with `>`, not `>>`.
 - Barriers assume the server answers each `PING` exactly once and in order
-  (verified live; a violation would shift barriers by one).
+  (verified live; a violation would shift barriers by one). A `PONG` comes
+  after every `book` sent before the `PING`, but it can overtake queued
+  `price_change` data.
+- After a failover to a lagging member, its switch snapshot can be seconds
+  older than what the old source wrote; the following changes catch up,
+  stamped no earlier than the switch.
 - Gamma's `/markets` rejects offsets past ~2000, so an incremental query
   reads at most 20 pages; the full pass catches the rest.
 - REST `/book` hashes include the request time, so REST books cannot be
