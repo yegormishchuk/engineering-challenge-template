@@ -1404,3 +1404,77 @@ async fn a_quiet_market_is_not_resubscribed() {
     assert_eq!((h.get(|s| &s.silent_resyncs), h.get(|s| &s.resyncs)), (0, 0));
     h.finish().await;
 }
+
+#[tokio::test]
+async fn a_recycle_reconnects_at_once() {
+    let (url, _log) = mock_server(|_, mut ws, log| async move {
+        next_text(&mut ws, &log, true).await;
+        send(&mut ws, BOOK_A).await;
+        idle(ws, log).await;
+    })
+    .await;
+    let h = start(fast_cfg(url), &["A"]);
+    eventually("first book", || h.get(|s| &s.books) == 1).await;
+    h.cmds.send(Command::Recycle).unwrap();
+    eventually("recycled", || h.get(|s| &s.recycles) == 1 && h.get(|s| &s.connects) == 2).await;
+    eventually("book again", || h.get(|s| &s.books) == 2).await;
+    assert_eq!(h.get(|s| &s.disconnects), 0, "a recycle is not a lost connection");
+    let msgs = h.finish().await;
+    let r = replay(&msgs);
+    assert!(r.file_is_consistent(), "{r:?}");
+}
+
+#[tokio::test]
+async fn recycling_the_source_hands_over_first() {
+    let (h, _) = two_member_shard(Default::default(), |server, mut ws, log| async move {
+        if server == 1 {
+            // After the handover: written by the new source.
+            answer_for(&mut ws, &log, Duration::from_millis(500)).await;
+            send(&mut ws, &change_a("20", 1793822782000)).await;
+        }
+        idle(ws, log).await;
+    })
+    .await;
+    assert_eq!(h.shard.lock().await.source, 0);
+    h.cmds[0].send(Command::Recycle).unwrap();
+    eventually("member 0 recycled", || h.get(0, |s| &s.recycles) == 1).await;
+    assert_eq!((h.switches(), h.shard.lock().await.source), (1, 1));
+    eventually("peer's change", || h.get(1, |s| &s.levels) == 1).await;
+    let msgs = h.finish().await;
+    assert!(kinds(&msgs).contains(&"U:A:20000000".to_string()), "{:?}", kinds(&msgs));
+    let r = replay(&msgs);
+    assert!(r.file_is_consistent(), "{r:?}");
+    assert_eq!((r.updates_without_baseline, r.mismatched), (0, 0), "{r:?}");
+}
+
+#[tokio::test]
+async fn recycling_the_source_without_a_ready_peer_is_skipped() {
+    let member0_up = Arc::new(tokio::sync::Notify::new());
+    let (url0, _) = mock_server(|_, mut ws, log| async move {
+        next_text(&mut ws, &log, true).await;
+        send(&mut ws, BOOK_A).await;
+        idle(ws, log).await;
+    })
+    .await;
+    let (url1, _) = mock_server({
+        let member0_up = Arc::clone(&member0_up);
+        move |_, ws, log| {
+            let member0_up = Arc::clone(&member0_up);
+            async move {
+                // Silent until member 0 is the source; then never a book.
+                member0_up.notified().await;
+                idle(ws, log).await;
+            }
+        }
+    })
+    .await;
+    let h = start_shard(vec![fast_cfg(url0), fast_cfg(url1)], &["A"]);
+    eventually("member 0 has its book", || h.get(0, |s| &s.books) == 1).await;
+    member0_up.notify_one();
+    eventually("member 1 connected", || h.get(1, |s| &s.connects) == 1).await;
+    assert_eq!(h.shard.lock().await.source, 0);
+    h.cmds[0].send(Command::Recycle).unwrap();
+    eventually("skipped", || h.get(0, |s| &s.recycles_skipped) == 1).await;
+    assert_eq!((h.get(0, |s| &s.recycles), h.get(0, |s| &s.connects), h.switches()), (0, 1, 0));
+    h.finish().await;
+}

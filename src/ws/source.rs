@@ -345,6 +345,25 @@ impl ShardSource {
         }
     }
 
+    /// Whether `member` may disconnect for a recycle (Extension 2). A
+    /// non-source may if the source is up. The source first hands over to
+    /// the connected member with the most live baselines, if that member
+    /// has at least `ready_at_least`; otherwise the recycle is skipped.
+    /// Not limited by `hold`: a recycle is planned, not a reaction.
+    pub async fn release_for_recycle(&self, member: usize, ready_at_least: usize) -> bool {
+        let mut st = self.lock().await;
+        if st.source != member {
+            return st.connected[st.source];
+        }
+        match self.best_connected(&st, member) {
+            Some(best) if self.baselines[best].load(Ordering::Relaxed) >= ready_at_least => {
+                self.switch(&mut st, best, "recycle");
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Called by a non-source member about to write: takes over if the
     /// source is down and this member is up. Returns whether it is the
     /// source now.

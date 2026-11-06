@@ -74,6 +74,12 @@ struct Args {
     #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u64).range(1..=4))]
     redundancy: u64,
 
+    /// Reconnect every socket once per this many hours, one at a time, to
+    /// clear state built up on the exchange's side; a source hands over to
+    /// a ready peer first. 0 = never.
+    #[arg(long, default_value_t = 6.0)]
+    recycle_hours: f64,
+
     /// Seconds between counter logs.
     #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
     stats_every: u64,
@@ -135,6 +141,9 @@ async fn main() -> anyhow::Result<()> {
         Some(discovery_tx),
     )
     .with_redundancy(args.redundancy as usize);
+    if args.recycle_hours > 0.0 {
+        shards = shards.with_recycle(Duration::from_secs_f64(args.recycle_hours * 3600.0));
+    }
 
     let mut tracker = Tracker::new(TrackerConfig {
         max_markets: args.max_markets,
@@ -155,6 +164,7 @@ async fn main() -> anyhow::Result<()> {
 
     let mut stats_every = tokio::time::interval(Duration::from_secs(args.stats_every));
     stats_every.tick().await;
+    let mut recycle_every = tokio::time::interval(Duration::from_secs(10));
     let mut failed = None;
     loop {
         tokio::select! {
@@ -180,6 +190,11 @@ async fn main() -> anyhow::Result<()> {
                     _ => continue,
                 };
                 apply_diff(&mut shards, &tracker, "ws-event", diff);
+            }
+            _ = recycle_every.tick() => {
+                if let Some(conn) = shards.recycle_tick(std::time::Instant::now()) {
+                    info!(conn, "recycling connection");
+                }
             }
             _ = stats_every.tick() => {
                 info!(markets = tracker.len(), symbols = shards.len(), "tracked");
@@ -248,6 +263,8 @@ fn log_stats(shards: &ShardManager) {
             switch_without_baseline = s.switch_without_baseline.load(Relaxed),
             silent_resyncs = s.silent_resyncs.load(Relaxed),
             active_symbols = s.active_symbols.load(Relaxed),
+            recycles = s.recycles.load(Relaxed),
+            recycles_skipped = s.recycles_skipped.load(Relaxed),
             lock_wait_ms = s.lock_wait_us.load(Relaxed) / 1000,
             max_lock_wait_us = s.max_lock_wait_us.load(Relaxed),
             mb = s.bytes.load(Relaxed) / 1_000_000,

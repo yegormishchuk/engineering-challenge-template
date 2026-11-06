@@ -126,8 +126,10 @@ def main():
         per_m = totals["mismatched_books"] / levels * 1e6
         print(f"  {'mismatched_books / 1M levels':28} {per_m:10.2f}")
     print(f"  {'mismatched + gap_mismatched':28} {totals['mismatched_books'] + totals['gap_mismatched_books']:10,}")
-    down = [c for c, f in conn_last.items() if int(f["connects"]) - int(f["disconnects"]) != 1]
-    print(f"  connections with connects - disconnects != 1: {down or 'none'}")
+    # A recycle reconnects without counting a disconnect.
+    down = [c for c, f in conn_last.items()
+            if int(f["connects"]) - int(f["disconnects"]) - int(f.get("recycles", 0)) != 1]
+    print(f"  connections with connects - disconnects - recycles != 1: {down or 'none'}")
 
     print(f"\n== tracked over time ({len(tracked)} samples)")
     for t, markets, symbols in spread(tracked):

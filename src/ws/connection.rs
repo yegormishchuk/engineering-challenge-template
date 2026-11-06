@@ -190,6 +190,9 @@ impl Default for ConnectionConfig {
 pub enum Command {
     Add(Vec<String>),
     Remove(Vec<String>),
+    /// Reconnect now, resubscribing everything (Extension 2): clears any
+    /// state built up on the exchange's side of the socket.
+    Recycle,
 }
 
 /// Per-connection counters, readable while the connection runs.
@@ -243,6 +246,10 @@ pub struct ConnStats {
     /// baselines (books that changes apply to).
     pub active_symbols: AtomicU64,
     pub live_baselines: AtomicU64,
+    /// Reconnects ordered by `Command::Recycle`, and ones skipped (the
+    /// source had no ready peer to hand over to, or no session was open).
+    pub recycles: AtomicU64,
+    pub recycles_skipped: AtomicU64,
 }
 
 fn inc(counter: &AtomicU64) {
@@ -352,6 +359,8 @@ pub struct Connection {
 enum SessionEnd {
     Shutdown,
     Lost(String),
+    /// Closed on purpose by `Command::Recycle`; reconnect at once.
+    Recycle,
 }
 
 /// Why a frame handler stopped the session.
@@ -524,6 +533,22 @@ impl Connection {
         Ok(())
     }
 
+    /// Whether this connection may close for a recycle now; counts a skip.
+    /// With redundancy the source hands over first, to a peer with books
+    /// for at least 99% of the symbols.
+    async fn release_for_recycle(&self) -> bool {
+        let Some(m) = &self.member else {
+            return true;
+        };
+        let ready = (self.symbols.len() * 99).div_ceil(100);
+        if m.shard.release_for_recycle(m.index, ready).await {
+            return true;
+        }
+        inc(&self.stats.recycles_skipped);
+        info!(conn = self.id, "recycle skipped: no ready peer to take over");
+        false
+    }
+
     fn report_baselines(&self) {
         let live = self.books.live_len();
         self.stats.live_baselines.store(live as u64, Ordering::Relaxed);
@@ -602,6 +627,14 @@ impl Connection {
                     self.report_baselines();
                     match end {
                         Ok(SessionEnd::Shutdown) => return Ok(()),
+                        Ok(SessionEnd::Recycle) => {
+                            if let Some(m) = &self.member {
+                                m.shard.lost(m.index).await;
+                            }
+                            inc(&self.stats.recycles);
+                            info!(conn = self.id, "recycled; reconnecting");
+                            continue;
+                        }
                         Ok(SessionEnd::Lost(reason)) => {
                             // Hand over before logging, so the peer can
                             // write while this one reconnects.
@@ -638,6 +671,8 @@ impl Connection {
                     self.forget(s);
                 }
             }
+            // No session to recycle; counted so the manager does not wait.
+            Command::Recycle => inc(&self.stats.recycles_skipped),
         }
     }
 
@@ -817,6 +852,13 @@ impl Connection {
                                     }
                                     self.pending.push_back(s);
                                 }
+                            }
+                            Ok(())
+                        }
+                        Some(Command::Recycle) => {
+                            if self.release_for_recycle().await {
+                                self.close(&mut ws).await;
+                                return Ok(SessionEnd::Recycle);
                             }
                             Ok(())
                         }

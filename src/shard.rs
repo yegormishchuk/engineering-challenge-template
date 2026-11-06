@@ -9,6 +9,8 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::Ordering::Relaxed;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use tokio::sync::{mpsc, watch};
@@ -36,6 +38,23 @@ impl std::fmt::Display for Failure {
     }
 }
 
+/// A connection told to recycle that has not come back by then is given up
+/// on, so one stuck connection cannot stop recycling for good.
+pub const RECYCLE_STUCK_AFTER: Duration = Duration::from_secs(600);
+
+struct Recycle {
+    every: Duration,
+    last: Option<Ordered>,
+}
+
+/// The last recycle order: which connection, when, and its recycle + skip
+/// count at that time.
+struct Ordered {
+    conn: usize,
+    at: Instant,
+    ended_before: u64,
+}
+
 /// One shard: its member connections and their symbol count.
 struct Slot {
     txs: Vec<mpsc::UnboundedSender<Command>>,
@@ -56,6 +75,7 @@ pub struct ShardManager {
     slots: Vec<Slot>,
     assignment: HashMap<String, usize>,
     tasks: JoinSet<Result<(), WriterGone>>,
+    recycle: Option<Recycle>,
 }
 
 impl ShardManager {
@@ -84,6 +104,7 @@ impl ShardManager {
             slots: Vec::new(),
             assignment: HashMap::new(),
             tasks: JoinSet::new(),
+            recycle: None,
         }
     }
 
@@ -93,6 +114,56 @@ impl ShardManager {
         assert!(self.slots.is_empty(), "set redundancy before adding symbols");
         self.redundancy = redundancy;
         self
+    }
+
+    /// Recycle every connection once per `every`, one at a time.
+    pub fn with_recycle(mut self, every: Duration) -> Self {
+        self.recycle = Some(Recycle { every, last: None });
+        self
+    }
+
+    /// Called periodically: tells the next connection to recycle when it is
+    /// time, and returns its id. Connections with symbols take turns in id
+    /// order, `every / their number` apart; the next one waits until the
+    /// previous one has reconnected with books for 99% of its symbols (or
+    /// skipped), or [`RECYCLE_STUCK_AFTER`] has passed.
+    pub fn recycle_tick(&mut self, now: Instant) -> Option<usize> {
+        let r = self.redundancy;
+        let recycle = self.recycle.as_ref()?;
+        let busy: Vec<usize> = (0..self.slots.len() * r)
+            .filter(|&c| self.slots[c / r].count > 0)
+            .collect();
+        if busy.is_empty() {
+            return None;
+        }
+        let spacing = recycle.every / busy.len() as u32;
+        if let Some(last) = &recycle.last {
+            let since = now.saturating_duration_since(last.at);
+            if since < spacing {
+                return None;
+            }
+            let slot = &self.slots[last.conn / r];
+            let stats = &slot.stats[last.conn % r];
+            let ended = stats.recycles.load(Relaxed) + stats.recycles_skipped.load(Relaxed) > last.ended_before;
+            let ready = stats.live_baselines.load(Relaxed) as usize >= (slot.count * 99).div_ceil(100);
+            if !(ended && ready) {
+                if since < RECYCLE_STUCK_AFTER {
+                    return None;
+                }
+                tracing::warn!(conn = last.conn, "recycled connection not back in time; moving on");
+            }
+        }
+        let after = recycle.last.as_ref().map(|l| l.conn);
+        let conn = busy
+            .iter()
+            .copied()
+            .find(|&c| after.is_none_or(|a| c > a))
+            .unwrap_or(busy[0]);
+        let stats = &self.slots[conn / r].stats[conn % r];
+        let ended_before = stats.recycles.load(Relaxed) + stats.recycles_skipped.load(Relaxed);
+        let _ = self.slots[conn / r].txs[conn % r].send(Command::Recycle);
+        self.recycle.as_mut().expect("checked").last = Some(Ordered { conn, at: now, ended_before });
+        Some(conn)
     }
 
     pub fn len(&self) -> usize {
@@ -301,6 +372,75 @@ mod tests {
         assert_eq!(counts(&m), [3, 3, 1, 1]);
         assert_eq!(m.len(), 4);
         assert_eq!(m.sources().len(), 2);
+        shutdown.cancel();
+        m.join().await;
+        writer.join().unwrap();
+    }
+
+    // ---- Recycling (Extension 2) ----
+
+    /// Marks connection `conn` as having finished a recycle, with every
+    /// book back.
+    fn mark_done(m: &ShardManager, conn: usize) {
+        let (count, stats) = &m.connections()[conn];
+        stats.recycles.fetch_add(1, Relaxed);
+        stats.live_baselines.store(*count as u64, Relaxed);
+    }
+
+    #[tokio::test]
+    async fn recycles_go_round_robin_one_at_a_time() {
+        let (m, writer, shutdown, _dir) = manager(3);
+        let mut m = m.with_recycle(Duration::from_secs(2));
+        m.add(syms(0..6)); // two connections: 1 s apart
+        let t0 = Instant::now();
+        assert_eq!(m.recycle_tick(t0), Some(0));
+        assert_eq!(m.recycle_tick(t0 + Duration::from_secs(1)), None, "connection 0 is not back yet");
+        mark_done(&m, 0);
+        assert_eq!(m.recycle_tick(t0 + Duration::from_millis(500)), None, "too soon");
+        assert_eq!(m.recycle_tick(t0 + Duration::from_secs(1)), Some(1));
+        mark_done(&m, 1);
+        assert_eq!(m.recycle_tick(t0 + Duration::from_secs(2)), Some(0), "round robin");
+        shutdown.cancel();
+        m.join().await;
+        writer.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_recycle_is_done_only_with_its_books_back() {
+        let (m, writer, shutdown, _dir) = manager(3);
+        let mut m = m.with_recycle(Duration::from_secs(2));
+        m.add(syms(0..6));
+        let t0 = Instant::now();
+        assert_eq!(m.recycle_tick(t0), Some(0));
+        m.connections()[0].1.recycles.fetch_add(1, Relaxed);
+        m.connections()[0].1.live_baselines.store(2, Relaxed); // of 3
+        assert_eq!(m.recycle_tick(t0 + Duration::from_secs(1)), None);
+        m.connections()[0].1.live_baselines.store(3, Relaxed);
+        assert_eq!(m.recycle_tick(t0 + Duration::from_secs(1)), Some(1));
+        shutdown.cancel();
+        m.join().await;
+        writer.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_stuck_recycle_is_abandoned_after_the_timeout() {
+        let (m, writer, shutdown, _dir) = manager(3);
+        let mut m = m.with_recycle(Duration::from_secs(2));
+        m.add(syms(0..6));
+        let t0 = Instant::now();
+        assert_eq!(m.recycle_tick(t0), Some(0));
+        assert_eq!(m.recycle_tick(t0 + RECYCLE_STUCK_AFTER - Duration::from_millis(1)), None);
+        assert_eq!(m.recycle_tick(t0 + RECYCLE_STUCK_AFTER), Some(1));
+        shutdown.cancel();
+        m.join().await;
+        writer.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn recycle_off_orders_nothing() {
+        let (mut m, writer, shutdown, _dir) = manager(3);
+        m.add(syms(0..6));
+        assert_eq!(m.recycle_tick(Instant::now()), None);
         shutdown.cancel();
         m.join().await;
         writer.join().unwrap();
