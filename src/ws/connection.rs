@@ -40,11 +40,9 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
 use indexmap::IndexSet;
-use tokio::net::TcpStream;
 use tokio::sync::{OwnedMutexGuard, mpsc, watch};
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -53,7 +51,7 @@ use crate::exchange::{Event, polymarket};
 use crate::writer::{OutMsg, OutSender, WriterGone};
 use crate::ws::source::{ShardSource, State as SourceState};
 
-type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
+use crate::ws::reader::Ws;
 
 /// Spaces requests evenly, shared by every connection: at full scale ~100
 /// connections each start REST checks at about the same time.
