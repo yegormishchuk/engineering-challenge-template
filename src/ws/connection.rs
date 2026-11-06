@@ -25,7 +25,9 @@
 //! load a book can sit unread in the socket long after it was sent. So it is
 //! made only when the stream itself proves the book is not coming:
 //! - a `PONG` arrived for a `PING` sent after the subscription (the server
-//!   answers in order, so a book would have come first), and at least
+//!   answers in order, so a book would have come first; checked live on
+//!   2026-11-06: of 1944 books for 3000 tokens, none arrived after the PONG
+//!   of the PING sent right after their subscription), and at least
 //!   `empty_book_after` has passed; or
 //! - a change arrives for the symbol whose *exchange* timestamp is at least
 //!   `empty_book_on_change_after` later than the subscription.
@@ -64,6 +66,10 @@ pub struct VerifyConfig {
     /// After a failed request the wait doubles, up to `max_backoff`.
     pub every: Duration,
     pub max_backoff: Duration,
+    /// A guess is wrong only if REST levels stay missing from the local book
+    /// for at least this long: REST and the stream are not read at the same
+    /// instant, and a new order can reach one a little before the other.
+    pub confirm_after: Duration,
     /// After this many REST results showing orders for a book the websocket
     /// never sends, stop checking the symbol (it would otherwise resync
     /// forever).
@@ -78,6 +84,7 @@ impl VerifyConfig {
             batch: 200,
             every: Duration::from_secs(2),
             max_backoff: Duration::from_secs(60),
+            confirm_after: Duration::from_secs(5),
             give_up_after: 3,
         }
     }
@@ -197,7 +204,17 @@ fn add(counter: &AtomicU64, n: usize) {
 /// Result of one REST check of assumed-empty books.
 struct Verified {
     checked: Vec<String>,
-    result: Result<Vec<String>, String>,
+    result: Result<HashMap<String, polymarket::RestBook>, String>,
+}
+
+/// Levels as `(side is bid, price, quantity)`, for comparing books.
+type LevelSet = HashSet<(bool, i64, i64)>;
+
+fn level_set(bids: &[(i64, i64)], asks: &[(i64, i64)]) -> LevelSet {
+    bids.iter()
+        .map(|&(p, q)| (true, p, q))
+        .chain(asks.iter().map(|&(p, q)| (false, p, q)))
+        .collect()
 }
 
 pub struct Connection {
@@ -226,14 +243,19 @@ pub struct Connection {
     pings: VecDeque<Instant>,
     /// Send time of the newest `PING` answered by a `PONG`.
     acked_through: Option<Instant>,
-    /// Symbols unsubscribed for a resync whose new subscription is not sent
-    /// yet. Their book messages are still in flight from before and are
-    /// dropped, so they cannot become a baseline.
-    resyncing: HashSet<String>,
+    /// Symbols unsubscribed for a resync, with the send time of the `PING`
+    /// that followed the unsubscribe. Until that `PING` is answered, data
+    /// for them may still be from before the unsubscribe, so it is dropped;
+    /// the new subscription's book comes after the `PONG`.
+    resyncing: HashMap<String, Instant>,
     /// Symbols whose current baseline is an empty guess, not an exchange book.
     assumed: HashSet<String>,
     /// Assumed-empty symbols waiting for a REST check.
     to_verify: Vec<String>,
+    /// REST levels missing from the local book, per symbol, since when. A
+    /// guess is wrong only if some of the same levels are still missing
+    /// `confirm_after` later.
+    suspect: HashMap<String, (Instant, LevelSet)>,
     /// Wrong empty guesses per symbol, and symbols no longer checked.
     wrong_guesses: HashMap<String, u32>,
     gave_up: HashSet<String>,
@@ -280,9 +302,10 @@ impl Connection {
             awaiting_book: HashMap::new(),
             pings: VecDeque::new(),
             acked_through: None,
-            resyncing: HashSet::new(),
+            resyncing: HashMap::new(),
             assumed: HashSet::new(),
             to_verify: Vec::new(),
+            suspect: HashMap::new(),
             wrong_guesses: HashMap::new(),
             gave_up: HashSet::new(),
             verify_not_before: Instant::now(),
@@ -375,6 +398,7 @@ impl Connection {
         self.awaiting_book.remove(s);
         self.resyncing.remove(s);
         self.assumed.remove(s);
+        self.suspect.remove(s);
         self.wrong_guesses.remove(s);
         self.gave_up.remove(s);
         self.symbols.shift_remove(s)
@@ -414,6 +438,7 @@ impl Connection {
         // Everything is resubscribed from scratch; old guesses are stale.
         self.resyncing.clear();
         self.assumed.clear();
+        self.suspect.clear();
         let empty_every = self
             .cfg
             .empty_book_after
@@ -517,8 +542,9 @@ impl Connection {
                                 .into_iter()
                                 .filter(|s| self.forget(s))
                                 .collect();
-                            self.pending.retain(|p| !gone.contains(p));
-                            self.to_verify.retain(|p| !gone.contains(p));
+                            let gone_set: HashSet<&String> = gone.iter().collect();
+                            self.pending.retain(|p| !gone_set.contains(p));
+                            self.to_verify.retain(|p| !gone_set.contains(p));
                             self.send_unsubscribe(&mut ws, &gone).await
                         }
                     };
@@ -606,12 +632,15 @@ impl Connection {
                 if !self.symbols.contains(&symbol) {
                     return Ok(()); // late message for a removed symbol
                 }
-                if self.resyncing.contains(&symbol) {
+                if self.resyncing.contains_key(&symbol) {
                     inc(&self.stats.dropped_during_resync);
                     return Ok(());
                 }
                 self.awaiting_book.remove(&symbol);
+                // A real exchange book settles any empty guess.
                 self.assumed.remove(&symbol);
+                self.suspect.remove(&symbol);
+                self.wrong_guesses.remove(&symbol);
                 match self.books.apply_snapshot(&symbol, bids, asks, exchange_ts, received_at) {
                     Ok(applied) => {
                         inc(&self.stats.books);
@@ -635,7 +664,7 @@ impl Connection {
                 if !self.symbols.contains(&symbol) {
                     return Ok(());
                 }
-                if self.resyncing.contains(&symbol) {
+                if self.resyncing.contains_key(&symbol) {
                     inc(&self.stats.dropped_during_resync);
                     return Ok(());
                 }
@@ -670,6 +699,8 @@ impl Connection {
                 *last_pong = Instant::now();
                 if let Some(sent) = self.pings.pop_front() {
                     self.acked_through = Some(sent);
+                    // Resyncs whose old data has now all been read.
+                    self.resyncing.retain(|_, barrier| *barrier > sent);
                     // The barrier just moved: books still missing now are
                     // not coming.
                     self.assume_empty_books().await?;
@@ -723,16 +754,27 @@ impl Connection {
             return Ok(());
         }
         inc(&self.stats.resyncs);
+        let set: HashSet<&String> = symbols.iter().collect();
         for s in symbols {
             self.books.mark_stale(s);
             self.awaiting_book.remove(s);
             self.assumed.remove(s);
-            self.resyncing.insert(s.clone());
+            self.suspect.remove(s);
         }
-        self.to_verify.retain(|p| !symbols.contains(p));
-        self.send_unsubscribe(ws, symbols).await.map_err(Stop::Lost)?;
+        self.to_verify.retain(|p| !set.contains(p));
+        if self.initial_sent {
+            self.send_unsubscribe(ws, symbols).await.map_err(Stop::Lost)?;
+            // Barrier: once answered, nothing from before the unsubscribe
+            // is left unread.
+            self.send_ping(ws).await.map_err(Stop::Lost)?;
+            let barrier = *self.pings.back().expect("just sent");
+            for s in symbols {
+                self.resyncing.insert(s.clone(), barrier);
+            }
+        }
+        let queued: HashSet<String> = self.pending.iter().cloned().collect();
         for s in symbols {
-            if !self.pending.contains(s) {
+            if !queued.contains(s) {
                 self.pending.push_back(s.clone());
             }
         }
@@ -750,7 +792,6 @@ impl Connection {
         let (now, now_utc) = (Instant::now(), Utc::now());
         for s in &batch {
             self.awaiting_book.insert(s.clone(), (now, now_utc));
-            self.resyncing.remove(s);
         }
         let msg = if self.initial_sent {
             polymarket::encode_subscribe(&batch)
@@ -825,7 +866,7 @@ impl Connection {
                 if !status.is_success() {
                     return Err(format!("HTTP {status}"));
                 }
-                polymarket::symbols_with_orders(&body).map_err(|e| e.to_string())
+                polymarket::parse_books_response(&body).map_err(|e| e.to_string())
             }
             .await;
             let _ = done.send(Verified { checked, result });
@@ -836,10 +877,10 @@ impl Connection {
         let Some(verify) = self.cfg.verify.clone() else {
             return Ok(());
         };
-        let with_orders = match verified.result {
-            Ok(with_orders) => {
+        let rest_books = match verified.result {
+            Ok(books) => {
                 self.verify_backoff = Duration::ZERO;
-                with_orders
+                books
             }
             Err(error) => {
                 inc(&self.stats.verify_errors);
@@ -853,14 +894,47 @@ impl Connection {
             }
         };
         let mut wrong = Vec::new();
+        let mut recheck = Vec::new();
         for s in verified.checked {
             // Only symbols whose baseline is still the guess: a real exchange
             // book since then has settled it either way.
             if !self.assumed.contains(&s) {
                 continue;
             }
-            if !with_orders.contains(&s) {
+            // REST levels the local book (the guess plus any changes applied
+            // to it) does not have. Orders placed after the guess reach both,
+            // so they do not count; orders that rested before it reach only
+            // REST.
+            let missing: LevelSet = match (rest_books.get(&s), self.books.get(&s)) {
+                (None, _) => LevelSet::new(),
+                (Some(rest), local) => {
+                    let local = local.map_or_else(LevelSet::new, |b| {
+                        level_set(
+                            &b.bids().iter().map(|(&p, &q)| (p, q)).collect::<Vec<_>>(),
+                            &b.asks().iter().map(|(&p, &q)| (p, q)).collect::<Vec<_>>(),
+                        )
+                    });
+                    level_set(&rest.bids, &rest.asks).difference(&local).copied().collect()
+                }
+            };
+            if missing.is_empty() {
+                self.suspect.remove(&s);
                 inc(&self.stats.empty_confirmed);
+                continue;
+            }
+            // Wrong only if some of the same levels stay missing for
+            // `confirm_after`: a level that just changed can be in one source
+            // and not yet in the other.
+            let (since, still) = match self.suspect.remove(&s) {
+                Some((since, before)) => {
+                    let still: LevelSet = before.intersection(&missing).copied().collect();
+                    if still.is_empty() { (Instant::now(), missing) } else { (since, still) }
+                }
+                None => (Instant::now(), missing),
+            };
+            if since.elapsed() < verify.confirm_after {
+                self.suspect.insert(s.clone(), (since, still));
+                recheck.push(s);
                 continue;
             }
             inc(&self.stats.empty_wrong);
@@ -878,12 +952,13 @@ impl Connection {
                 wrong.push(s);
             }
         }
+        self.to_verify.extend(recheck);
         if !wrong.is_empty() {
             warn!(
                 conn = self.id,
                 symbols = wrong.len(),
                 first = %wrong[0],
-                "REST shows orders for books assumed empty; resyncing them"
+                "REST shows resting orders missing from books assumed empty; resyncing them"
             );
             self.resync(ws, &wrong).await?;
         }

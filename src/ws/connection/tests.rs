@@ -561,6 +561,55 @@ async fn mock_books_http(with_orders: &'static [&'static str]) -> (String, Arc<M
     (url, bodies)
 }
 
+/// Like `mock_books_http`, with an explicit JSON book per token.
+async fn mock_books_http_with(books: &'static [(&'static str, &'static str)]) -> (String, Arc<Mutex<Vec<String>>>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/books", listener.local_addr().unwrap());
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&bodies);
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let log = Arc::clone(&log);
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let body = loop {
+                    let n = stream.read(&mut chunk).await.unwrap();
+                    if n == 0 {
+                        return;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    let text = String::from_utf8_lossy(&buf).to_string();
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let len: usize = text[..end]
+                            .lines()
+                            .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse().unwrap()))
+                            .unwrap_or(0);
+                        if buf.len() >= end + 4 + len {
+                            break text[end + 4..end + 4 + len].to_string();
+                        }
+                    }
+                };
+                let requested: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+                log.lock().unwrap().push(body);
+                let parts: Vec<&str> = requested
+                    .iter()
+                    .filter_map(|r| r["token_id"].as_str())
+                    .filter_map(|t| books.iter().find(|(id, _)| *id == t).map(|(_, b)| *b))
+                    .collect();
+                let out = format!("[{}]", parts.join(","));
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{out}",
+                    out.len()
+                );
+                stream.write_all(resp.as_bytes()).await.unwrap();
+            });
+        }
+    });
+    (url, bodies)
+}
+
 fn verify_cfg(url: String) -> Option<VerifyConfig> {
     Some(VerifyConfig {
         http: reqwest::Client::new(),
@@ -568,6 +617,7 @@ fn verify_cfg(url: String) -> Option<VerifyConfig> {
         batch: 200,
         every: Duration::from_millis(50),
         max_backoff: Duration::from_millis(200),
+        confirm_after: Duration::from_millis(150),
         give_up_after: 3,
     })
 }
@@ -599,8 +649,9 @@ async fn rest_showing_orders_for_an_assumed_empty_book_triggers_a_resync() {
     eventually("unsubscribe + subscribe for B", || log.lock().unwrap().len() >= 3).await;
     {
         let log = log.lock().unwrap();
-        assert!(log[1].contains("unsubscribe") && log[1].contains("\"B\"") && !log[1].contains("\"A\""), "{log:?}");
-        assert!(log[2].contains("\"operation\":\"subscribe\"") && log[2].contains("\"B\""), "{log:?}");
+        let texts: Vec<&String> = log.iter().filter(|m| m.as_str() != "PING").collect();
+        assert!(texts[1].contains("unsubscribe") && texts[1].contains("\"B\"") && !texts[1].contains("\"A\""), "{log:?}");
+        assert!(texts[2].contains("\"operation\":\"subscribe\"") && texts[2].contains("\"B\""), "{log:?}");
     }
     assert_eq!(h.get(|s| &s.empty_confirmed), 1, "A was confirmed");
     h.finish().await;
@@ -740,5 +791,64 @@ async fn repeated_wrong_empty_guesses_give_up() {
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(h.get(|s| &s.resyncs), resyncs, "no more resyncs after giving up");
     assert_eq!(h.get(|s| &s.empty_wrong), 2);
+    h.finish().await;
+}
+
+#[tokio::test]
+async fn an_order_placed_after_a_correct_empty_guess_is_not_a_wrong_guess() {
+    // B's book really is empty; then an order arrives and REST sees it too.
+    let (ws_url, _log) = mock_server(|_, mut ws, log| async move {
+        next_text(&mut ws, &log, true).await;
+        answer_for(&mut ws, &log, Duration::from_millis(300)).await;
+        // The order REST will report: SELL 0.10 x 1.
+        send(&mut ws, &change_b_at(Utc::now().timestamp_millis())).await;
+        idle(ws, log).await;
+    })
+    .await;
+    let (http_url, _requests) = mock_books_http_with(&[("B", r#"{"asset_id":"B","bids":[],"asks":[{"price":"0.10","size":"1"}]}"#)]).await;
+    let mut cfg = fast_cfg(ws_url);
+    cfg.empty_book_after = Duration::from_millis(50);
+    // REST sees the order ~300 ms before the stream does; the confirmation
+    // window must be longer than that lead, as it is in production (5 s).
+    cfg.verify = verify_cfg(http_url).map(|mut v| {
+        v.confirm_after = Duration::from_secs(1);
+        v
+    });
+    let h = start(cfg, &["B"]);
+    eventually("change applied", || h.get(|s| &s.levels) == 1).await;
+    eventually("checked after the change", || h.get(|s| &s.empty_confirmed) >= 1).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(h.get(|s| &s.empty_wrong), 0);
+    assert_eq!(h.get(|s| &s.resyncs), 0);
+    h.finish().await;
+}
+
+#[tokio::test]
+async fn a_stale_book_read_after_the_resubscribe_is_still_dropped() {
+    let bad = CHANGE_A.replace("\"BUY\"", "\"HOLD\"");
+    let (url, _log) = mock_server(move |_, mut ws, log| {
+        let bad = bad.clone();
+        async move {
+            next_text(&mut ws, &log, true).await; // subscribe A
+            send(&mut ws, BOOK_A).await;
+            send(&mut ws, &bad).await; // the client resyncs A
+            // The client unsubscribes, sends its barrier PING and soon the new
+            // subscribe; this server is behind and answers nothing yet.
+            ignore_pings_for(&mut ws, &log, Duration::from_millis(300)).await;
+            // Still from before the unsubscribe, read after the resubscribe.
+            send(&mut ws, BOOK_A).await;
+            send(&mut ws, CHANGE_A).await;
+            // Now the barrier PING is answered, then the fresh book follows.
+            answer_for(&mut ws, &log, Duration::from_millis(100)).await;
+            send(&mut ws, &BOOK_A.replace("\"10\"", "\"12\"")).await;
+            idle(ws, log).await;
+        }
+    })
+    .await;
+    let h = start(fast_cfg(url), &["A"]);
+    eventually("fresh book", || h.get(|s| &s.books) == 2).await;
+    assert_eq!(h.get(|s| &s.dropped_during_resync), 2, "stale book and change dropped");
+    assert_eq!(h.get(|s| &s.mismatched_books), 0);
+    assert_eq!(h.get(|s| &s.levels), 0);
     h.finish().await;
 }

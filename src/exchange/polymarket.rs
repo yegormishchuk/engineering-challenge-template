@@ -54,18 +54,38 @@ pub fn encode_books_request(symbols: &[String]) -> String {
     Value::Array(symbols.iter().map(|s| json!({ "token_id": s })).collect()).to_string()
 }
 
-/// From a [`BOOKS_URL`] response, the symbols whose book has at least one
-/// level. Tokens without orders are absent from the response.
-pub fn symbols_with_orders(body: &str) -> Result<Vec<String>, DecodeError> {
+/// One book from a [`BOOKS_URL`] response, in fixed point.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestBook {
+    pub bids: Vec<(i64, i64)>,
+    pub asks: Vec<(i64, i64)>,
+}
+
+/// Parses a [`BOOKS_URL`] response into the books that have at least one
+/// level, by symbol. Tokens without orders are absent from the response.
+pub fn parse_books_response(body: &str) -> Result<std::collections::HashMap<String, RestBook>, DecodeError> {
     let books: Vec<Value> = serde_json::from_str(body).map_err(DecodeError::Json)?;
-    Ok(books
-        .iter()
-        .filter(|b| {
-            let non_empty = |side: &str| b[side].as_array().is_some_and(|a| !a.is_empty());
-            non_empty("bids") || non_empty("asks")
+    let side = |b: &Value, key: &str| -> Result<Vec<(i64, i64)>, DecodeError> {
+        let raw: Vec<RawLevel> = serde_json::from_value(b[key].clone()).unwrap_or_default();
+        levels(&raw).map(|mut l| {
+            l.retain(|&(_, q)| q != 0);
+            l
         })
-        .filter_map(|b| b["asset_id"].as_str().map(str::to_owned))
-        .collect())
+    };
+    let mut out = std::collections::HashMap::new();
+    for b in &books {
+        let Some(symbol) = b["asset_id"].as_str() else {
+            continue;
+        };
+        let book = RestBook {
+            bids: side(b, "bids")?,
+            asks: side(b, "asks")?,
+        };
+        if !book.bids.is_empty() || !book.asks.is_empty() {
+            out.insert(symbol.to_owned(), book);
+        }
+    }
+    Ok(out)
 }
 
 #[derive(Debug)]
@@ -462,13 +482,17 @@ mod tests {
     }
 
     #[test]
-    fn books_response_lists_only_tokens_with_orders() {
+    fn books_response_keeps_only_tokens_with_orders() {
         let body = r#"[
             {"asset_id":"1","bids":[{"price":"0.1","size":"5"}],"asks":[]},
             {"asset_id":"2","bids":[],"asks":[]},
-            {"asset_id":"3","bids":[],"asks":[{"price":"0.9","size":"1"}]}
+            {"asset_id":"3","bids":[],"asks":[{"price":"0.9","size":"1"},{"price":"0.95","size":"0"}]}
         ]"#;
-        assert_eq!(symbols_with_orders(body).unwrap(), ["1", "3"]);
-        assert!(symbols_with_orders("{}").is_err());
+        let books = parse_books_response(body).unwrap();
+        assert_eq!(books.len(), 2);
+        assert_eq!(books["1"].bids, [(100_000, 5_000_000)]);
+        assert_eq!(books["3"].asks, [(900_000, 1_000_000)], "zero sizes dropped");
+        assert!(parse_books_response("{}").is_err());
+        assert!(parse_books_response(r#"[{"asset_id":"1","bids":[{"price":"x","size":"1"}]}]"#).is_err());
     }
 }
