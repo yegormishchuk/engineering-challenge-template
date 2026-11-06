@@ -115,6 +115,19 @@ async fn ignore_pings_for(ws: &mut ServerWs, log: &Mutex<Vec<String>>, dur: Dura
     owed
 }
 
+/// Reads until one PING arrives and answers it.
+async fn answer_one_ping(ws: &mut ServerWs, log: &Mutex<Vec<String>>) {
+    while let Some(Ok(msg)) = ws.next().await {
+        if let Message::Text(t) = msg {
+            if t.as_str() == "PING" {
+                ws.send(Message::text("PONG")).await.unwrap();
+                return;
+            }
+            log.lock().unwrap().push(t.to_string());
+        }
+    }
+}
+
 /// Answers PINGs that were held back, in order.
 async fn pong_owed(ws: &mut ServerWs, owed: usize) {
     for _ in 0..owed {
@@ -884,38 +897,39 @@ async fn a_stale_book_read_after_the_resubscribe_is_still_dropped() {
 
 #[tokio::test]
 async fn a_rest_result_waits_until_the_stream_catches_up() {
-    // An order is placed while data is in flight to a lagging reader: REST
-    // shows it at once, the stream delivers it (and the PONGs) only later.
-    // The check must not call the correct empty guess wrong meanwhile.
-    let placed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let server_placed = Arc::clone(&placed);
-    let (ws_url, _log) = mock_server(move |_, mut ws, log| {
-        let placed = Arc::clone(&server_placed);
-        async move {
-            next_text(&mut ws, &log, true).await;
-            answer_for(&mut ws, &log, Duration::from_millis(200)).await; // guess happens
-            placed.store(true, std::sync::atomic::Ordering::SeqCst);
-            let owed = ignore_pings_for(&mut ws, &log, Duration::from_millis(600)).await;
-            send(&mut ws, &change_b_at(Utc::now().timestamp_millis())).await;
-            pong_owed(&mut ws, owed).await;
-            idle(ws, log).await;
-        }
+    // A correct empty guess, then an order is placed. REST shows the order
+    // at once; to this lagging reader the stream delivers it (and every
+    // PONG) only much later. Judged before the stream caught up, the check
+    // would call the guess wrong once `confirm_after` passed.
+    let (ws_url, _log) = mock_server(|_, mut ws, log| async move {
+        next_text(&mut ws, &log, true).await; // the subscribe
+        answer_one_ping(&mut ws, &log).await; // its barrier, so the guess can happen
+        // Behind from here: hold every PING for many `confirm_after` periods.
+        let owed = ignore_pings_for(&mut ws, &log, Duration::from_millis(800)).await;
+        send(&mut ws, &change_b_at(Utc::now().timestamp_millis())).await;
+        pong_owed(&mut ws, owed).await;
+        idle(ws, log).await;
     })
     .await;
-    let (http_url, _requests) = mock_books_http_with(
+    let (http_url, requests) = mock_books_http_with(
         &[("B", r#"{"asset_id":"B","bids":[],"asks":[{"price":"0.10","size":"1"}]}"#)],
-        Some(placed),
+        None,
     )
     .await;
     let mut cfg = fast_cfg(ws_url);
     cfg.empty_book_after = Duration::from_millis(50);
     cfg.verify = verify_cfg(http_url).map(|mut v| {
-        v.confirm_after = Duration::from_millis(100); // much shorter than the lag
+        v.confirm_after = Duration::from_millis(100);
         v
     });
     let h = start(cfg, &["B"]);
     eventually("change applied", || h.get(|s| &s.levels) == 1).await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    eventually("judged after catching up", || h.get(|s| &s.empty_confirmed) >= 1).await;
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        1,
+        "the first result waited for the stream; no re-check while it waited"
+    );
     assert_eq!(h.get(|s| &s.empty_wrong), 0);
     assert_eq!(h.get(|s| &s.resyncs), 0);
     h.finish().await;

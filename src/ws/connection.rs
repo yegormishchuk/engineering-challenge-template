@@ -266,19 +266,22 @@ pub struct Connection {
     pending: VecDeque<String>,
     /// Whether the current socket has sent its initial subscription.
     initial_sent: bool,
-    /// Symbols subscribed on the current socket that have no `book` yet, with
-    /// the time their subscription was sent (monotonic, and wall clock for
-    /// comparing with exchange timestamps).
-    awaiting_book: HashMap<String, (Instant, DateTime<Utc>)>,
-    /// Send times of `PING`s not yet answered, oldest first.
-    pings: VecDeque<Instant>,
-    /// Send time of the newest `PING` answered by a `PONG`.
-    acked_through: Option<Instant>,
-    /// Symbols unsubscribed for a resync, with the send time of the `PING`
-    /// that followed the unsubscribe. Until that `PING` is answered, data
-    /// for them may still be from before the unsubscribe, so it is dropped;
-    /// the new subscription's book comes after the `PONG`.
-    resyncing: HashMap<String, Instant>,
+    /// Symbols subscribed on the current socket that have no `book` yet: when
+    /// the subscription was sent (monotonic, and wall clock for comparing
+    /// with exchange timestamps) and the number of its barrier `PING`.
+    awaiting_book: HashMap<String, (Instant, DateTime<Utc>, u64)>,
+    /// `PING`s are numbered, so a barrier is identified exactly (two sends
+    /// can share an `Instant`). The next number to use; never reset.
+    next_ping: u64,
+    /// Numbers of `PING`s not yet answered, oldest first.
+    pings: VecDeque<u64>,
+    /// Number of the newest `PING` answered by a `PONG`.
+    acked_through: Option<u64>,
+    /// Symbols unsubscribed for a resync, with the number of the `PING` that
+    /// followed the unsubscribe. Until that `PING` is answered, data for them
+    /// may still be from before the unsubscribe, so it is dropped; the new
+    /// subscription's book comes after the `PONG`.
+    resyncing: HashMap<String, u64>,
     /// Symbols whose current baseline is an empty guess, not an exchange book.
     assumed: HashSet<String>,
     /// Assumed-empty symbols waiting for a REST check.
@@ -287,11 +290,11 @@ pub struct Connection {
     /// arrived: each with the send time of the `PING` sent then. Judged only
     /// once that `PING` is answered, so a lagging reader cannot make a
     /// correct guess look wrong.
-    verify_waiting: VecDeque<(Instant, Verified)>,
+    verify_waiting: VecDeque<(u64, Verified)>,
     /// Symbols unsubscribed on this socket, with the barrier `PING` sent
     /// after the unsubscribe. If one is added back before that `PING` is
     /// answered, data from the old subscription is dropped like in a resync.
-    recently_removed: HashMap<String, Instant>,
+    recently_removed: HashMap<String, u64>,
     /// REST levels missing from the local book, per symbol, since when. A
     /// guess is wrong only if some of the same levels are still missing
     /// `confirm_after` later.
@@ -340,6 +343,7 @@ impl Connection {
             pending: VecDeque::new(),
             initial_sent: false,
             awaiting_book: HashMap::new(),
+            next_ping: 0,
             pings: VecDeque::new(),
             acked_through: None,
             resyncing: HashMap::new(),
@@ -453,10 +457,13 @@ impl Connection {
         }
     }
 
-    async fn send_ping(&mut self, ws: &mut Ws) -> Result<(), String> {
+    /// Sends a `PING` and returns its number.
+    async fn send_ping(&mut self, ws: &mut Ws) -> Result<u64, String> {
         self.ws_send(ws, polymarket::PING.to_owned()).await?;
-        self.pings.push_back(Instant::now());
-        Ok(())
+        let n = self.next_ping;
+        self.next_ping += 1;
+        self.pings.push_back(n);
+        Ok(n)
     }
 
     async fn close(&self, ws: &mut Ws) {
@@ -551,10 +558,10 @@ impl Connection {
                 }
                 Some(verified) = verified_rx.recv() => {
                     verify_in_flight = false;
-                    if let Err(reason) = self.send_ping(&mut ws).await {
-                        return Ok(SessionEnd::Lost(reason));
-                    }
-                    let barrier = *self.pings.back().expect("just sent");
+                    let barrier = match self.send_ping(&mut ws).await {
+                        Ok(n) => n,
+                        Err(reason) => return Ok(SessionEnd::Lost(reason)),
+                    };
                     self.verify_waiting.push_back((barrier, verified));
                 }
                 _ = ping.tick() => {
@@ -722,7 +729,7 @@ impl Connection {
                     let overdue = self
                         .awaiting_book
                         .get(&symbol)
-                        .is_some_and(|(_, sent_at)| exchange_ts >= *sent_at + margin);
+                        .is_some_and(|(_, sent_at, _)| exchange_ts >= *sent_at + margin);
                     if !overdue {
                         inc(&self.stats.skipped_no_baseline);
                         return Ok(());
@@ -745,13 +752,13 @@ impl Connection {
             }
             Event::Pong => {
                 *last_pong = Instant::now();
-                if let Some(sent) = self.pings.pop_front() {
-                    self.acked_through = Some(sent);
+                if let Some(acked) = self.pings.pop_front() {
+                    self.acked_through = Some(acked);
                     // Resyncs and removals whose old data has now all been read.
-                    self.resyncing.retain(|_, barrier| *barrier > sent);
-                    self.recently_removed.retain(|_, barrier| *barrier > sent);
+                    self.resyncing.retain(|_, barrier| *barrier > acked);
+                    self.recently_removed.retain(|_, barrier| *barrier > acked);
                     // REST results the stream has now caught up with.
-                    while self.verify_waiting.front().is_some_and(|(barrier, _)| *barrier <= sent) {
+                    while self.verify_waiting.front().is_some_and(|(barrier, _)| *barrier <= acked) {
                         let (_, verified) = self.verify_waiting.pop_front().expect("checked");
                         Box::pin(self.on_verified(ws, verified)).await?;
                     }
@@ -820,8 +827,7 @@ impl Connection {
             self.send_unsubscribe(ws, symbols).await.map_err(Stop::Lost)?;
             // Barrier: once answered, nothing from before the unsubscribe
             // is left unread.
-            self.send_ping(ws).await.map_err(Stop::Lost)?;
-            let barrier = *self.pings.back().expect("just sent");
+            let barrier = self.send_ping(ws).await.map_err(Stop::Lost)?;
             for s in symbols {
                 self.resyncing.insert(s.clone(), barrier);
             }
@@ -844,8 +850,10 @@ impl Connection {
             return Ok(());
         }
         let (now, now_utc) = (Instant::now(), Utc::now());
+        // The PING sent right after this batch is its barrier.
+        let barrier = self.next_ping;
         for s in &batch {
-            self.awaiting_book.insert(s.clone(), (now, now_utc));
+            self.awaiting_book.insert(s.clone(), (now, now_utc, barrier));
         }
         let msg = if self.initial_sent {
             polymarket::encode_subscribe(&batch)
@@ -856,7 +864,9 @@ impl Connection {
         self.ws_send(ws, msg).await?;
         // The barrier: once this PING is answered, every book for the batch
         // has been delivered (see the module docs).
-        self.send_ping(ws).await
+        let sent = self.send_ping(ws).await?;
+        debug_assert_eq!(sent, barrier);
+        Ok(())
     }
 
     /// Gives every symbol whose `book` is overdue an empty baseline and
@@ -869,7 +879,7 @@ impl Connection {
         let mut overdue: Vec<String> = self
             .awaiting_book
             .iter()
-            .filter(|(_, (sent, _))| sent.elapsed() >= grace && acked > *sent)
+            .filter(|(_, (sent, _, barrier))| sent.elapsed() >= grace && acked >= *barrier)
             .map(|(s, _)| s.clone())
             .collect();
         overdue.sort_unstable();
@@ -907,23 +917,32 @@ impl Connection {
         };
         let n = self.to_verify.len().min(verify.batch);
         let checked: Vec<String> = self.to_verify.drain(..n).collect();
+        let body = polymarket::encode_books_request(&checked);
+        // The work runs in an inner task so that the outer one always
+        // reports back, even if the work panics; otherwise `verify_in_flight`
+        // would stay set and checks would stop for the session.
         tokio::spawn(async move {
-            verify.limiter.acquire().await;
-            let request = verify
-                .http
-                .post(&verify.url)
-                .header("Content-Type", "application/json")
-                .body(polymarket::encode_books_request(&checked));
-            let result = async {
-                let resp = request.send().await.map_err(|e| e.to_string())?;
+            let work = tokio::spawn(async move {
+                verify.limiter.acquire().await;
+                let resp = verify
+                    .http
+                    .post(&verify.url)
+                    .header("Content-Type", "application/json")
+                    .body(body)
+                    .send()
+                    .await
+                    .map_err(|e| e.to_string())?;
                 let status = resp.status();
                 let body = resp.text().await.map_err(|e| e.to_string())?;
                 if !status.is_success() {
                     return Err(format!("HTTP {status}"));
                 }
                 polymarket::parse_books_response(&body).map_err(|e| e.to_string())
-            }
-            .await;
+            });
+            let result = match work.await {
+                Ok(result) => result,
+                Err(e) => Err(format!("check task failed: {e}")),
+            };
             let _ = done.send(Verified { checked, result });
         });
     }
@@ -1027,8 +1046,7 @@ impl Connection {
             return Ok(());
         }
         self.send_unsubscribe(ws, gone).await?;
-        self.send_ping(ws).await?;
-        let barrier = *self.pings.back().expect("just sent");
+        let barrier = self.send_ping(ws).await?;
         for s in gone {
             self.recently_removed.insert(s.clone(), barrier);
         }
