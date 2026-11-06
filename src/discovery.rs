@@ -58,7 +58,7 @@ fn is_tradable(m: &Value) -> bool {
         && m["cyom"] != true
 }
 
-fn parse_market(m: &Value) -> Option<MarketObs> {
+pub fn parse_market(m: &Value) -> Option<MarketObs> {
     let condition_id = m["conditionId"].as_str()?.to_owned();
     let tokens = string_array(&m["clobTokenIds"]);
     let tradable = is_tradable(m) && !tokens.is_empty();

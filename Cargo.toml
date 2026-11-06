@@ -17,7 +17,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.154"
 tempfile = "3"
 tikv-jemallocator = "0.7.0"
-tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "time", "signal", "sync"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "time", "signal", "sync", "net"] }
 tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-webpki-roots"] }
 tokio-util = "0.7.20"
 tracing = "0.1.44"
