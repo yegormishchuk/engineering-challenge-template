@@ -12,6 +12,72 @@ channel is public. This repository is based on the
 the SBE schema, generated DTOs, `AlignedSbeWriter`/`AlignedSbeReader` and
 `Side` (`src/util/`, `src/side.rs`, `sbe_schemas/`) come from it unchanged.
 
+## Challenge coverage
+
+Every run below ended with `validate` = `CONSISTENT`, `receive time
+reversals` 0 and `updates without baseline` 0. The run artefacts (`.log`,
+`.validate`, `.mem`, `.info`) are in `~/runs/<name>.*` on the test host
+(WSL2); `python3 scripts/summarize.py ~/runs/<name>.log` regenerates a
+summary. "Mismatched" is `mismatched_books` per million levels (exchange
+books that differed from the local book, Log counters). The commands are
+under [Evidence runs](#evidence-runs).
+
+| # | Requirement | How it is met | Evidence |
+| --- | --- | --- | --- |
+| R1 | Connect to Kalshi, or Polymarket without a Kalshi account | Polymarket: no Kalshi account. Public market channel, no key | `full30g` |
+| R2 | Subscribe to all live symbols, no MVEs | Gamma discovery of every tradable market, `cyom` excluded ([What it does](#what-it-does), [Design](#design)) | `full30g`: 486k symbols |
+| R3 | Maintain an order book per symbol | One book per token, owned by one connection ([Sharding](#design)) | `full30g`, `r2-25k-30m` |
+| R4 | Subscribe to new symbols, unsubscribe from ones no longer trading | Three discovery layers feeding one tracker ([Design](#design)) | `e2-90m-25k`: 3 full passes, 37 `subscriptions changed` lines |
+| R5 | Spread symbols over several websockets | 5000 tokens per socket, least-loaded first ([Design](#design)) | `full30g`: ~100 sockets |
+| R6 | Deltas to stdout, a full snapshot every minute, with the template helpers | `PriceLevelUpdate` per change, `Snapshot` per book each minute, through `AlignedSbeWriter` ([Output format](#output-format)) | all runs |
+| R7 | On SIGINT close the websockets and the output file | Close frames, queue drained, file flushed, exit 0 ([Shutdown](#shutdown)) | every run ends with `output flushed and closed` |
+| Q1 | Data complete | Exchange books checked against the local book, resync on any loss ([Checkpoints](#design), [Redundancy](#redundancy), [Validating a file](#validating-a-file)) | `r2-25k-30m`: 0.71 mismatched; `e2-90m-25k`: 0.38; `full30g`: 3.1 but 395 disconnects (see below) |
+| Q2 | Data time-accurate | Receive stamp taken by a reader task when the frame is read, before parsing and queueing; per-token monotonic; exact minute snapshots ([Time stamps](#design)) | reversals 0 in all runs. Before the change (`full30e`) writer backpressure stalled reads for ~1 s; now reads never wait for the writer, so `queue_ms` is processing delay and the stamps are unaffected |
+| E1 | Redundant websockets, snapshot on source switch | `--redundancy` ([Redundancy](#redundancy)) | `e1-r1` / `e1-r2` (10k tokens, 30 min, two forced drops by iptables): R=2 switched source on each drop (`source lost its connection`), 3.70 mismatched vs 4.07 for R=1 |
+| E2 | Subscription monitoring, periodic socket recycling | Quiet-token check and `--recycle-hours` ([Subscription monitoring](#subscription-monitoring)) | `e2-90m-25k` (90 min, recycle every 15 min): 110 recycles, 0 skipped, 74 silent resyncs, 16,906 active symbols, 0.38 mismatched, 11 disconnects |
+| E3 | Generic encode/decode per exchange | `Exchange` / `Codec` / `BookApi` traits in `src/exchange/mod.rs`, Polymarket behind them ([Adding an exchange](#adding-an-exchange)). The second exchange is **test-only** (no Kalshi account): a mock with a different protocol, sequence numbers and signed deltas. Discovery stays per exchange (the `Poll` / `Tracker` interface) | tests in `src/ws/connection/tests.rs`: `a_second_exchange_records_books_and_deltas`, `a_sequence_gap_resyncs_the_symbol`, `a_negative_delta_resyncs_the_symbol`, `mock_exchange_makes_no_empty_guesses`, `deltas_after_a_gap_start_only_one_resync` |
+| E4 | Latency experiments, findings in a markdown file | `src/bin/latency.rs` probe, `scripts/latency_report.py`; findings in [LATENCY.md](LATENCY.md). In one line: best-of-N sockets cuts tail delay; source port and server IP showed no stable gain; host bandwidth is the main limit | [LATENCY.md](LATENCY.md) |
+
+### Completeness at full scale depends on the link
+
+The full 30-minute run (`full30g`, `--redundancy 1`, 486k symbols) was
+consistent, with 3.1 mismatched books per million levels, a 1.16 GiB peak
+RSS and 18.4 GB/h of output. It also had 395 disconnects (255 with no
+`PONG`, 132 resets). They come from the test host's link, not from the
+collector:
+
+- The link measured ~3–5 MB/s in total (a CDN download: 3.0 MB/s over 6
+  streams). The collector received ~4.8–5.1 MB/s, so the link is the cap.
+- The market channel needs more than 5 MB/s even at half scale: `diagB`
+  (240k tokens) received 5.15 MB/s and had 23 disconnects in 12 min. A
+  smaller load fits: `r2-25k-30m` (50k tokens, R=2) used 2.9 MB/s and
+  had 1 disconnect in 30 min.
+- Polymarket does not negotiate permessage-deflate, so the volume cannot
+  be reduced on the client.
+- Output to `/dev/null` instead of a file (`diagA`) did not remove the
+  disconnects (66 in 11.8 min), so the disk path is not the main cause.
+
+A disconnect costs a gap, handled as any reconnect (stale books,
+`gap_mismatched_books`); the file stays consistent. **Deployment
+requirement (estimated, not measured):** at least ~10 MB/s of inbound
+bandwidth for full scale at `--redundancy 1`, and about twice that at
+`--redundancy 2`, since each member receives the full stream.
+
+### Evidence runs
+
+All runs use `scripts/run.sh <name> --duration <secs> -- <flags>` on commit
+`41671a7` or later. `--max-markets 25000` is 50k tokens.
+
+| Run | Flags | Duration | Key result |
+| --- | --- | --- | --- |
+| `full30g` | `--redundancy 1 --recycle-hours 0` | 30 min | 486k symbols, 3.1 mismatched, 395 disconnects (link), peak RSS 1.16 GiB, 18.4 GB/h |
+| `diagA` | as `full30g`, with `--output /dev/null` | 11.8 min | 66 disconnects at 5.1 MB/s |
+| `diagB` | as `full30g`, with `--max-markets 120000` | 12 min | 23 disconnects at 5.15 MB/s |
+| `r2-25k-30m` | `--max-markets 25000 --redundancy 2 --recycle-hours 0` | 30 min | 1 disconnect, 0.71 mismatched, 2.9 MB/s, peak RSS 0.72 GiB |
+| `e1-r1` | `--max-markets 5000 --redundancy 1` | 30 min | 1 disconnect, 4.07 mismatched |
+| `e1-r2` | `--max-markets 5000 --redundancy 2`, plus iptables DROP of the sockets for 40 s at ~10 and ~20 min | 30 min | source switch on each drop, 3.70 mismatched |
+| `e2-90m-25k` | `--max-markets 25000 --redundancy 2 --recycle-hours 0.25` | 90 min | 110 recycles (0 skipped), 3 full passes, 74 silent resyncs, 0.38 mismatched, 11 disconnects |
+
 ## What it does
 
 - Discovers every tradable market from Polymarket's Gamma API
@@ -49,11 +115,12 @@ export CARGO_TARGET_DIR=~/target/engineering-challenge
 
 ```bash
 cargo build --release
-cargo test           # ~90 tests, incl. mock websocket/HTTP servers; no network
+cargo test           # ~150 tests, incl. mock websocket/HTTP servers; no network
 ```
 
 Binaries: `engineering-challenge` (the collector), `validate` (file
-checker), `capture` (research probe, not needed to run).
+checker), `capture` and `latency` (research probes, not needed to run;
+see [LATENCY.md](LATENCY.md)).
 
 ## Run
 
@@ -100,7 +167,7 @@ every 30 s, stops it with SIGINT, and validates. Logs stay in `~/runs/`;
 | `--full-every-mins <n>` | 30 | Minutes between full discovery passes |
 | `--recent-every-secs <n>` | 30 | Seconds between incremental discovery polls |
 | `--channel-capacity <n>` | 65536 | Writer queue, in messages |
-| `--no-verify-empty` | off | Skip REST checks of books assumed empty |
+| `--no-verify-empty` | off | Skip the REST checks of books assumed empty (guesses are then never verified) |
 | `--verify-rate <r>` | 10 | REST checks per second, over all connections |
 | `--redundancy <r>` | 2 | Connections per shard, all subscribed to the same tokens; one writes (1–4; 1 = no redundancy; each member about doubles memory) |
 | `--recycle-hours <h>` | 6 | Reconnect every socket once per this many hours, one at a time (0 = never; see Subscription monitoring) |
@@ -210,7 +277,7 @@ Counters are totals since start.
 | `ignored` | messages not recorded (`last_trade_price`, `best_bid_ask`, …) |
 | `busy_ms`, `max_frame_us` | time spent handling frames, total and longest single frame |
 | `queue_ms`, `max_queue_us` | delay between a frame being read by the reader task (its receive time) and the connection starting to process it: total in ms, longest single delay in µs |
-| `max_queued_frames` | largest number of frames read but not yet processed. A `frame backlog growing` warning is logged at 1024, 2048, 4096, … |
+| `max_queued_frames` | largest number of frames read but not yet processed. A `frame backlog growing` warning is logged once per new power of two (1024, 2048, 4096, …) per session |
 | `switch_snapshots`, `switch_without_baseline` | snapshots this connection wrote on becoming its shard's source; symbols it had no live book for then (nothing is written for them until their next book) |
 | `lock_wait_ms`, `max_lock_wait_us` | time waiting for the shard's output lock, total and longest |
 | `silent_resyncs` | active tokens resubscribed because they went quiet (see Subscription monitoring) |
@@ -244,7 +311,8 @@ the end markets the pass did not list are removed, except ones changed after
 the pass began. A pass listing under half the tracked markets removes
 nothing.
 
-**Exchange layer.** Only `src/exchange/` knows Polymarket. The core
+**Exchange layer.** Only `src/exchange/`, discovery (`src/discovery.rs`) and
+`VerifyConfig::polymarket` (the REST check defaults) know Polymarket. The core
 (connections, books, shards, writer) speaks to it through the `Exchange`
 trait (URL, heartbeat text, capabilities, a per-socket `Codec`, optional
 REST book check) and sees only normalized `Event`s. See
@@ -265,7 +333,8 @@ tokens in one message overflowed its send buffer ("slow consumer"). Each
 connection subscribes 100 tokens every 250 ms.
 
 **Barriers.** Polymarket has no sequence numbers, but it answers the text
-`PING` in order, after every frame it sent before it (verified live). The
+`PING`, and the `PONG` comes after every frame it sent before the `PING`
+(assumed, not proven; see Known limitations). The
 collector numbers its `PING`s and uses the matching `PONG` as a barrier:
 after an unsubscribe (for a resync or removal), data for the token is dropped
 until the barrier, so nothing from the old subscription leaks into the new
@@ -337,8 +406,9 @@ shard checks, shutdown, recycle). Frames read before a drop or shutdown are
 still processed and written. A connection is lost when no `PONG` has been
 read for 30 s after a `PING` was sent: the oldest `PING` sent after the last
 `PONG` read is more than 30 s old. Not when the oldest unanswered `PING` is:
-with the download saturated (~4–6 MB/s for ~100 connections) the server
-still answers every `PING` in order, but up to 47 s later, while earlier
+with the download at its cap (~4.8–5.1 MB/s observed; the host link, ~3–5 MB/s
+measured to a CDN, is the cap) the server still answers every `PING`
+exactly once (counted), but up to 47 s later, while earlier
 `PONG`s keep arriving (live probe: 30 sockets, 1560 of 1560 answered); that
 rule dropped 765 healthy sockets in 18 min, and each reconnect's book burst
 added to the backlog.
@@ -424,12 +494,14 @@ exchange supplies two things:
    subscribe / unsubscribe messages and decodes each text frame into
    `Event`s: `Book` (full book), `Level` (`LevelKind::Absolute` sets a
    quantity, `LevelKind::Delta` adds a signed change), `Pong` (the
-   heartbeat's answer), `MarketAdded` / `MarketResolved`, `Ignored`. A
+   heartbeat's answer), `MarketAdded` / `MarketResolved`, `TickSizeChanged` (logged only),
+`Ignored`. A
    message it cannot decode, or a **sequence gap**, is returned as a
    `Failure` naming its symbols; the connection then resyncs exactly those.
    Set `missing_book_means_empty` only if the exchange sends no book for a
    symbol without orders (Polymarket): it enables the empty-book guesses,
-   checked over REST if `book_api()` is given. Pass the impl as
+   checked over REST if `book_api()` is given and verification is on (not
+   `--no-verify-empty`). Pass the impl as
    `ConnectionConfig::exchange` in `main.rs`.
 2. **A discovery poller** that sends `Poll`s to the `Tracker` (as
    `discovery.rs` does with Polymarket's Gamma API). Discovery is
@@ -464,9 +536,10 @@ Measured live in November 2026.
 | Full discovery pass | ~10 min, ~210 pages |
 | Subscribe → book | p50 0.27 s, p99 0.74 s |
 | Receive − exchange time | p50 ~0.4 s, p99 ~0.75 s (includes clock offset) |
-| Memory | ~4 KB per token (≈ 2 GB projected at 514k) |
+| Memory | ~4 KB per token at R=1; `full30g` (486k symbols, R=1): peak RSS 1.16 GiB. Each extra redundancy member about doubles it |
 | Writer | ~790k snapshots/s through queue and thread; average load at 204k tokens ~14k messages/s |
-| Output | ~9 GB/h at 204k tokens |
+| Output | ~9 GB/h at 204k tokens; 18.4 GB/h at full scale (`full30g`) |
+| Inbound | ~4.8–5.1 MB/s observed on the test host, whose link is the cap; the full channel needs more (see Challenge coverage) |
 | REST checks | 10 requests/s × 200 tokens each (default) |
 
 ## Known limitations
@@ -478,10 +551,14 @@ Measured live in November 2026.
 - The change-path empty guess compares exchange time with local time; a host
   clock more than 1.5 s behind the exchange can make guesses early (the next
   book or the REST check corrects them).
+- Full-scale completeness needs inbound bandwidth the test host lacked (see
+  Challenge coverage): there, disconnects and the gaps they cause are the
+  main loss of continuity, though every file validated.
 - A crash loses up to one 64 MiB chunk (see Shutdown).
 - `--output -` writes through `/dev/stdout`: redirect with `>`, not `>>`.
-- Barriers assume the server answers each `PING` exactly once and in order
-  (verified live, also with 30 sockets on a saturated link). A lost `PONG`
+- Barriers assume the server answers each `PING` exactly once and in order.
+  Once is verified (every `PING` answered exactly once, counted live, also
+  with 30 sockets on a saturated link); order is assumed. A lost `PONG`
   would make every later barrier pass one `PING` late (safe, only slower);
   an extra one would pass them early. The `PONG` timeout does not depend on
   it. A `PONG` comes
