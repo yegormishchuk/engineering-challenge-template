@@ -7,7 +7,7 @@
 //!
 //! | Trigger | Recovery |
 //! | --- | --- |
-//! | socket closed, error, or no `PONG` within `pong_timeout` | reconnect; mark all books stale; resubscribe everything |
+//! | socket closed, error, or no `PONG` read for `pong_timeout` after a `PING` | reconnect; mark all books stale; resubscribe everything |
 //! | frame that looks like JSON but does not parse | mark all books stale; unsubscribe + subscribe everything |
 //! | `book` / `price_change` that does not decode | the same, for the symbols it names (all if none) |
 //! | invalid level change or book for a symbol | the same, for that symbol |
@@ -336,6 +336,8 @@ pub struct Connection {
     acked_through: Option<u64>,
     /// When the newest answered `PING` was sent.
     acked_sent_at: Option<std::time::Instant>,
+    /// When the reader read the newest `PONG` handled on this socket.
+    last_pong_read: Option<std::time::Instant>,
     /// Symbols unsubscribed for a resync, with the number of the `PING` that
     /// followed the unsubscribe. Until that `PING` is answered, data for them
     /// may still be from before the unsubscribe, so it is dropped; the new
@@ -413,6 +415,7 @@ impl Connection {
             pings: VecDeque::new(),
             acked_through: None,
             acked_sent_at: None,
+            last_pong_read: None,
             resyncing: HashMap::new(),
             assumed: HashSet::new(),
             to_verify: Vec::new(),
@@ -705,6 +708,21 @@ impl Connection {
         Ok(n)
     }
 
+    /// How long, at `now`, the oldest `PING` sent after the last `PONG` read
+    /// has gone without any `PONG` read. Only that is silence: under a
+    /// saturated download PONGs come in order but tens of seconds after
+    /// their PING (47 s seen live) while earlier ones keep arriving, so the
+    /// age of the oldest unanswered PING measures the backlog, not the
+    /// socket. A lost PONG is tolerated the same way.
+    fn unanswered_for(&self, now: std::time::Instant) -> Option<Duration> {
+        let read = self.last_pong_read;
+        self.pings
+            .iter()
+            .map(|&(_, sent)| sent)
+            .find(|&sent| read.is_none_or(|r| sent > r))
+            .map(|sent| now.saturating_duration_since(sent))
+    }
+
     async fn close(&self, ws: &mut WsSink) {
         if tokio::time::timeout(self.cfg.close_timeout, ws.close()).await.is_err() {
             debug!(conn = self.id, "websocket close timed out");
@@ -746,6 +764,7 @@ impl Connection {
         self.pings.clear();
         self.acked_through = None;
         self.acked_sent_at = None;
+        self.last_pong_read = None;
         // Everything is resubscribed from scratch; old guesses are stale.
         self.resyncing.clear();
         self.assumed.clear();
@@ -841,18 +860,18 @@ impl Connection {
                     self.verify_waiting.push_back((barrier, verified));
                 }
                 _ = ping.tick() => {
-                    // A PING counts as answered once its PONG has been read,
-                    // even if not yet handled. Judged by the oldest PING still
-                    // unanswered: while the writer stalls this task, no PING
-                    // is sent, so none can be answered.
+                    // Judged as of `now`, after handling every frame read
+                    // before it, so neither a stalled writer nor this task's
+                    // own lag counts.
+                    let now = std::time::Instant::now();
                     let t = self.clock.stamp();
                     if let Some(end) = self.catch_up(ws, rx, t).await? {
                         return Ok(end);
                     }
-                    if let Some(&(_, sent)) = self.pings.front()
-                        && sent.elapsed() > self.cfg.pong_timeout
+                    if let Some(waited) = self.unanswered_for(now)
+                        && waited > self.cfg.pong_timeout
                     {
-                        return Ok(SessionEnd::Lost(format!("no PONG for {:?}", sent.elapsed())));
+                        return Ok(SessionEnd::Lost(format!("no PONG for {waited:?}")));
                     }
                     if let Err(reason) = self.send_ping(ws).await {
                         return Ok(SessionEnd::Lost(reason));
@@ -1142,6 +1161,7 @@ impl Connection {
                 }
             }
             Event::Pong => {
+                self.last_pong_read = Some(self.frame_at);
                 if let Some((acked, sent_at)) = self.pings.pop_front() {
                     self.acked_through = Some(acked);
                     self.acked_sent_at = Some(sent_at);

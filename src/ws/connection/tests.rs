@@ -1618,6 +1618,105 @@ async fn a_stalled_writer_does_not_trip_the_pong_timeout() {
     drained.await.unwrap();
 }
 
+/// Answers the i-th PING `delay(i)` after it arrives, in order, like a
+/// server whose PONGs wait behind a download backlog, or never if
+/// `delay(i)` is `None` (lost). Logs every other text the client sends.
+async fn answer_pings_late(
+    ws: ServerWs,
+    log: Arc<Mutex<Vec<String>>>,
+    delay: impl Fn(usize) -> Option<Duration> + Send + 'static,
+) {
+    let (mut sink, mut stream) = ws.split();
+    let (tx, mut rx) = mpsc::unbounded_channel::<tokio::time::Instant>();
+    let pongs = tokio::spawn(async move {
+        while let Some(at) = rx.recv().await {
+            tokio::time::sleep_until(at).await;
+            if sink.send(Message::text("PONG")).await.is_err() {
+                return;
+            }
+        }
+    });
+    let mut i = 0;
+    while let Some(Ok(msg)) = stream.next().await {
+        if let Message::Text(t) = msg {
+            if t.as_str() == "PING" {
+                if let Some(d) = delay(i) {
+                    let _ = tx.send(tokio::time::Instant::now() + d);
+                }
+                i += 1;
+            } else {
+                log.lock().unwrap().push(t.to_string());
+            }
+        }
+    }
+    pongs.abort();
+}
+
+#[tokio::test]
+async fn a_lost_pong_does_not_drop_a_healthy_connection() {
+    // Every third PONG is lost; the rest come at once. Counted FIFO, the
+    // oldest "unanswered" PING gets older and older.
+    let (url, _log) = mock_server(|_, ws, log| answer_pings_late(ws, log, |i| (i % 3 != 2).then_some(Duration::ZERO))).await;
+    let mut cfg = fast_cfg(url);
+    cfg.pong_timeout = Duration::from_millis(300);
+    let h = start(cfg, &["A"]);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(h.get(|s| &s.disconnects), 0);
+    h.finish().await;
+}
+
+#[tokio::test]
+async fn a_pong_late_behind_a_backlog_does_not_drop_a_healthy_connection() {
+    // Live, under a saturated download, PONGs came in order but later and
+    // later (up to 47 s after their PING), while earlier ones kept arriving.
+    // Here each comes 20 ms later than the one before (one about every
+    // 70 ms), ~600 ms late, twice the timeout, by the end.
+    let (url, _log) = mock_server(|_, ws, log| {
+        answer_pings_late(ws, log, |i| Some(Duration::from_millis(20 * i as u64)))
+    })
+    .await;
+    let mut cfg = fast_cfg(url);
+    cfg.pong_timeout = Duration::from_millis(300);
+    let h = start(cfg, &["A"]);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(h.get(|s| &s.disconnects), 0);
+    h.finish().await;
+}
+
+#[tokio::test]
+async fn a_silent_server_is_dropped_within_the_pong_timeout() {
+    let silent_since = Arc::new(Mutex::new(None));
+    let (url, _log) = mock_server({
+        let silent_since = Arc::clone(&silent_since);
+        move |n, mut ws, log| {
+            let silent_since = Arc::clone(&silent_since);
+            async move {
+                if n == 0 {
+                    answer_for(&mut ws, &log, Duration::from_millis(300)).await;
+                    *silent_since.lock().unwrap() = Some(std::time::Instant::now());
+                    // Still connected and reading, but never answers again.
+                    while next_text(&mut ws, &log, false).await.is_some() {}
+                } else {
+                    idle(ws, log).await;
+                }
+            }
+        }
+    })
+    .await;
+    let mut cfg = fast_cfg(url);
+    cfg.pong_timeout = Duration::from_millis(300);
+    let (ping, timeout) = (cfg.ping_interval, cfg.pong_timeout);
+    let h = start(cfg, &["A"]);
+    eventually("disconnect after the server goes silent", || h.get(|s| &s.disconnects) >= 1).await;
+    let waited = silent_since.lock().unwrap().expect("went silent").elapsed();
+    // The first unanswered PING goes out within one interval of the last
+    // PONG (one may be in flight as the server stops), and is judged on the
+    // next tick after `pong_timeout`.
+    assert!(waited + ping >= timeout, "dropped after {waited:?}");
+    assert!(waited <= timeout + 2 * ping + Duration::from_millis(100), "dropped after {waited:?}");
+    h.finish().await;
+}
+
 #[tokio::test]
 async fn a_minute_snapshot_under_backlog_keeps_receive_order() {
     let (url, _log) = mock_server(|_, mut ws, log| async move {

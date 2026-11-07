@@ -294,8 +294,14 @@ T reflects every frame read before T and none read after: before writing
 it, the connection first processes the queued frames read before T. The
 same holds for the other outputs written on a timer (empty guesses,
 shard checks, shutdown, recycle). Frames read before a drop or shutdown are
-still processed and written. The `PONG` timeout counts from the oldest
-unanswered `PING`: a connection is lost when it was sent more than 30 s ago.
+still processed and written. A connection is lost when no `PONG` has been
+read for 30 s after a `PING` was sent: the oldest `PING` sent after the last
+`PONG` read is more than 30 s old. Not when the oldest unanswered `PING` is:
+with the download saturated (~4–6 MB/s for ~100 connections) the server
+still answers every `PING` in order, but up to 47 s later, while earlier
+`PONG`s keep arriving (live probe: 30 sockets, 1560 of 1560 answered); that
+rule dropped 765 healthy sockets in 18 min, and each reconnect's book burst
+added to the backlog.
 
 ## Redundancy
 
@@ -396,7 +402,10 @@ Measured live in November 2026.
 - A crash loses up to one 64 MiB chunk (see Shutdown).
 - `--output -` writes through `/dev/stdout`: redirect with `>`, not `>>`.
 - Barriers assume the server answers each `PING` exactly once and in order
-  (verified live; a violation would shift barriers by one). A `PONG` comes
+  (verified live, also with 30 sockets on a saturated link). A lost `PONG`
+  would make every later barrier pass one `PING` late (safe, only slower);
+  an extra one would pass them early. The `PONG` timeout does not depend on
+  it. A `PONG` comes
   after every `book` sent before the `PING`, but it can overtake queued
   `price_change` data.
 - After a failover to a lagging member, its switch snapshot can be seconds
