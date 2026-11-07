@@ -25,8 +25,13 @@ pub struct RecvClock {
 
 impl RecvClock {
     pub fn new() -> Arc<Self> {
+        Self::starting_at(DateTime::<Utc>::MIN_UTC)
+    }
+
+    /// A clock whose previous stamp was `last`.
+    fn starting_at(last: DateTime<Utc>) -> Arc<Self> {
         Arc::new(Self {
-            last: Mutex::new(DateTime::<Utc>::MIN_UTC),
+            last: Mutex::new(last),
         })
     }
 
@@ -100,8 +105,11 @@ mod tests {
 
     #[test]
     fn stamps_never_go_back() {
-        let clock = RecvClock::new();
-        let mut last = clock.stamp();
+        // A previous stamp in the future models a host clock that stepped
+        // back since it was taken.
+        let ahead = Utc::now() + chrono::Duration::hours(1);
+        let clock = RecvClock::starting_at(ahead);
+        let mut last = ahead;
         for _ in 0..1000 {
             let t = clock.stamp();
             assert!(t >= last);
@@ -113,17 +121,21 @@ mod tests {
     fn a_stamp_waits_for_an_earlier_frame_to_be_queued() {
         let clock = RecvClock::new();
         let queue = Arc::new(Mutex::new(Vec::new()));
+        let (inside_tx, inside_rx) = std::sync::mpsc::channel();
         let a = {
             let (clock, queue) = (Arc::clone(&clock), Arc::clone(&queue));
             std::thread::spawn(move || {
                 clock.stamp_with(|t| {
+                    inside_tx.send(()).unwrap();
+                    // Give B time to reach the lock; without the lock held
+                    // here, B would return before the push.
                     std::thread::sleep(Duration::from_millis(50));
                     queue.lock().unwrap().push(t);
                     t
                 })
             })
         };
-        std::thread::sleep(Duration::from_millis(10));
+        inside_rx.recv().unwrap();
         let t_b = clock.stamp();
         assert_eq!(queue.lock().unwrap().len(), 1);
         assert!(t_b >= a.join().unwrap());

@@ -1685,8 +1685,10 @@ async fn a_pong_late_behind_a_backlog_does_not_drop_a_healthy_connection() {
     h.finish().await;
 }
 
+/// Dropped no earlier than `pong_timeout - ping_interval` and no later than
+/// `pong_timeout + 2 * ping_interval` (+ slack) after the server goes silent.
 #[tokio::test]
-async fn a_silent_server_is_dropped_within_the_pong_timeout() {
+async fn a_silent_server_is_dropped_within_pong_timeout_plus_two_ping_intervals() {
     let silent_since = Arc::new(Mutex::new(None));
     let (url, _log) = mock_server({
         let silent_since = Arc::clone(&silent_since);
@@ -1717,6 +1719,16 @@ async fn a_silent_server_is_dropped_within_the_pong_timeout() {
     assert!(waited + ping >= timeout, "dropped after {waited:?}");
     assert!(waited <= timeout + 2 * ping + Duration::from_millis(100), "dropped after {waited:?}");
     h.finish().await;
+}
+
+#[test]
+fn a_backlog_warns_only_at_a_new_maximum_power_of_two() {
+    let mut warned = 0;
+    let warns: Vec<usize> = [1023, 1024, 1023, 1024, 2048, 1024, 1500, 2048, 4096]
+        .into_iter()
+        .filter(|&q| backlog_to_warn(q, &mut warned))
+        .collect();
+    assert_eq!(warns, [1024, 2048, 4096]);
 }
 
 #[tokio::test]
@@ -2016,6 +2028,43 @@ async fn a_sequence_gap_resyncs_the_symbol() {
     );
     let msgs = h.finish().await;
     assert_eq!(kinds(&msgs), ["S:A", "U:A:6000000", "S:A", "U:A:9000000"], "seq 4 not written");
+}
+
+#[tokio::test]
+async fn deltas_after_a_gap_start_only_one_resync() {
+    let (url, log) = mock_server(|_, mut ws, log| async move {
+        mock_next(&mut ws, &log).await; // subscribe
+        send(&mut ws, &mock_snap(1, "10")).await;
+        send(&mut ws, &mock_delta(3, "1")).await; // 2 is missing
+        for seq in 4..9 {
+            // Each fails too: the codec waits for the next snap.
+            send(&mut ws, &mock_delta(seq, "1")).await;
+        }
+        // Wait for the resubscription, skipping any extra unsubscribes.
+        while let Some(t) = mock_next(&mut ws, &log).await {
+            if t.contains(r#""op":"sub""#) {
+                break;
+            }
+        }
+        send(&mut ws, &mock_snap(10, "7")).await;
+        send(&mut ws, &mock_delta(11, "2")).await;
+        mock_idle(ws, log).await;
+    })
+    .await;
+    let h = start(mock_cfg(url), &["A"]);
+    eventually("delta after the new snap applied", || h.get(|s| &s.levels) == 1).await;
+    assert_eq!(h.get(|s| &s.decode_errors), 6);
+    assert_eq!(h.get(|s| &s.resyncs), 1);
+    assert_eq!(
+        mock_ops(&log),
+        [
+            serde_json::json!({"op":"sub","syms":["A"]}),
+            serde_json::json!({"op":"unsub","syms":["A"]}),
+            serde_json::json!({"op":"sub","syms":["A"]}),
+        ]
+    );
+    let msgs = h.finish().await;
+    assert_eq!(kinds(&msgs), ["S:A", "S:A", "U:A:9000000"]);
 }
 
 #[tokio::test]

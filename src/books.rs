@@ -239,7 +239,7 @@ impl Books {
     /// Applies one level change and returns the `PriceLevelUpdate` to write,
     /// always with the resulting absolute quantity (`0` removes the level).
     /// A [`LevelKind::Delta`] adds to the current quantity (a missing level
-    /// is 0); a result below 0 is an error. On error nothing changes.
+    /// is 0); a result below 0 or past `i64` is an error. On error nothing changes.
     #[allow(clippy::too_many_arguments)]
     pub fn apply_level(
         &mut self,
@@ -265,7 +265,15 @@ impl Books {
                     Side::Buy => entry.book.bids(),
                     Side::Sell => entry.book.asks(),
                 };
-                levels.get(&price).copied().unwrap_or(0).saturating_add(quantity)
+                levels
+                    .get(&price)
+                    .copied()
+                    .unwrap_or(0)
+                    .checked_add(quantity)
+                    .ok_or(BooksError::Book {
+                        symbol: symbol.to_owned(),
+                        error: BookError::QuantityOverflow { price },
+                    })?
             }
         };
         entry
@@ -439,6 +447,19 @@ mod tests {
         assert!(matches!(
             books.apply_level("T", Side::Buy, 100, -11, LevelKind::Delta, ts(2), ts(2)),
             Err(BooksError::Book { error: BookError::NegativeQuantity { .. }, .. })
+        ));
+        let book = books.get("T").unwrap();
+        assert_eq!(book.bids().get(&100), Some(&10));
+        assert_eq!(book.last_exchange_ts(), Some(ts(1)));
+    }
+
+    #[test]
+    fn a_delta_that_overflows_is_rejected() {
+        let mut books = Books::new();
+        books.apply_snapshot("T", [(100, 10)], [], ts(1), ts(1)).unwrap();
+        assert!(matches!(
+            books.apply_level("T", Side::Buy, 100, i64::MAX, LevelKind::Delta, ts(2), ts(2)),
+            Err(BooksError::Book { error: BookError::QuantityOverflow { price: 100 }, .. })
         ));
         let book = books.get("T").unwrap();
         assert_eq!(book.bids().get(&100), Some(&10));

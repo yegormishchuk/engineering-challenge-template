@@ -22,6 +22,8 @@ pub type Levels = BTreeMap<i64, i64>;
 pub enum BookError {
     NegativePrice { price: i64 },
     NegativeQuantity { price: i64, quantity: i64 },
+    /// A delta took the quantity at `price` past `i64`.
+    QuantityOverflow { price: i64 },
 }
 
 impl fmt::Display for BookError {
@@ -31,6 +33,7 @@ impl fmt::Display for BookError {
             Self::NegativeQuantity { price, quantity } => {
                 write!(f, "negative quantity {quantity} at price {price}")
             }
+            Self::QuantityOverflow { price } => write!(f, "quantity overflow at price {price}"),
         }
     }
 }

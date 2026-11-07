@@ -43,8 +43,10 @@ struct Args {
     out: PathBuf,
     #[arg(long, default_value_t = 8)]
     sockets: usize,
-    #[arg(long, default_value_t = 200)]
-    tokens: usize,
+    /// Tokens to fetch (default 200); with --tokens-file, use only the first N
+    /// (default: the whole file).
+    #[arg(long)]
+    tokens: Option<usize>,
     #[arg(long, default_value_t = 1800)]
     seconds: u64,
     /// Reuse a token list (one per line). The list in use is written to <csv>.tokens.
@@ -122,15 +124,31 @@ fn csv_row(c: &Conn, recv_us: i64, e: &Event) -> Option<String> {
 
 const HEADER: &str = "socket,session,local_port,remote_ip,connected_us,symbol,hash,recv_us,exchange_us";
 
+/// The tokens of a `--tokens-file`, the first `limit` if given.
+fn tokens_from_file(text: &str, limit: Option<usize>) -> Vec<String> {
+    let tokens = text.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_owned);
+    tokens.take(limit.unwrap_or(usize::MAX)).collect()
+}
+
+/// Appends the tokens not already in `tokens`, keeping their order.
+fn extend_unique(tokens: &mut Vec<String>, new: impl IntoIterator<Item = String>) {
+    for t in new {
+        if !tokens.contains(&t) {
+            tokens.push(t);
+        }
+    }
+}
+
 async fn pick_tokens(args: &Args) -> anyhow::Result<Vec<String>> {
     if let Some(path) = &args.tokens_file {
         let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-        return Ok(text.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_owned).collect());
+        return Ok(tokens_from_file(&text, args.tokens));
     }
+    let wanted = args.tokens.unwrap_or(200);
     let http = reqwest::Client::builder().gzip(true).build()?;
     let mut tokens = Vec::new();
     let mut offset = 0;
-    while tokens.len() < args.tokens {
+    while tokens.len() < wanted {
         let url = format!(
             "{GAMMA_URL}/markets?closed=false&active=true&order=volume24hr&ascending=false&limit=100&offset={offset}"
         );
@@ -140,10 +158,10 @@ async fn pick_tokens(args: &Args) -> anyhow::Result<Vec<String>> {
         }
         offset += page.len();
         for market in page.iter().filter_map(parse_market).filter(|m| m.tradable) {
-            tokens.extend(market.tokens);
+            extend_unique(&mut tokens, market.tokens);
         }
     }
-    tokens.truncate(args.tokens);
+    tokens.truncate(wanted);
     Ok(tokens)
 }
 
@@ -339,6 +357,24 @@ mod tests {
     fn parses_refresh() {
         assert_eq!(parse_refresh("4:600").unwrap(), (4, Duration::from_secs(600)));
         assert!(parse_refresh("4").is_err());
+    }
+
+    #[test]
+    fn a_tokens_file_is_cut_only_when_asked() {
+        let text = "a
+
+ b 
+c
+";
+        assert_eq!(tokens_from_file(text, None), ["a", "b", "c"]);
+        assert_eq!(tokens_from_file(text, Some(2)), ["a", "b"]);
+    }
+
+    #[test]
+    fn fetched_tokens_are_deduplicated_in_order() {
+        let mut tokens = vec!["a".to_string()];
+        extend_unique(&mut tokens, ["b", "a", "c", "b"].map(String::from));
+        assert_eq!(tokens, ["a", "b", "c"]);
     }
 
     #[test]

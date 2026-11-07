@@ -282,6 +282,17 @@ fn level_set(bids: &[(i64, i64)], asks: &[(i64, i64)]) -> LevelSet {
         .collect()
 }
 
+/// Whether a backlog of `queued` frames is worth a warning: a power of two
+/// from 1024 on, larger than any warned about before (`warned`, updated).
+/// A queue hovering around one power of two warns once.
+fn backlog_to_warn(queued: usize, warned: &mut usize) -> bool {
+    if queued >= 1024 && queued.is_power_of_two() && queued > *warned {
+        *warned = queued;
+        return true;
+    }
+    false
+}
+
 /// The next frame to handle: the held one, else the next from the reader.
 async fn next_frame(held: &mut Option<Frame>, rx: &mut mpsc::UnboundedReceiver<Frame>) -> Option<Frame> {
     match held.take() {
@@ -370,6 +381,8 @@ pub struct Connection {
     gave_up: HashSet<String>,
     verify_not_before: Instant,
     verify_backoff: Duration,
+    /// The largest frame backlog warned about in this session.
+    backlog_warned: usize,
 }
 
 enum SessionEnd {
@@ -432,6 +445,7 @@ impl Connection {
             gave_up: HashSet::new(),
             verify_not_before: Instant::now(),
             verify_backoff: Duration::ZERO,
+            backlog_warned: 0,
         }
     }
 
@@ -778,6 +792,7 @@ impl Connection {
         self.suspect.clear();
         self.verify_waiting.clear();
         self.recently_removed.clear();
+        self.backlog_warned = 0;
         let empty_every = self
             .cfg
             .empty_book_after
@@ -834,6 +849,11 @@ impl Connection {
                     }
                 }
                 _ = silence_check.tick() => {
+                    // Frames already read count as activity.
+                    let t = self.clock.stamp();
+                    if let Some(end) = self.catch_up(ws, rx, t).await? {
+                        return Ok(end);
+                    }
                     match self.check_silence(ws).await {
                         Ok(()) => {}
                         Err(Stop::Lost(reason)) => return Ok(SessionEnd::Lost(reason)),
@@ -955,12 +975,12 @@ impl Connection {
     }
 
     /// Counts how long `frame` waited, and the queue behind it.
-    fn note_queue(&self, frame: &Frame, queued: usize) {
+    fn note_queue(&mut self, frame: &Frame, queued: usize) {
         let us = frame.at.elapsed().as_micros() as u64;
         self.stats.queue_us.fetch_add(us, Ordering::Relaxed);
         self.stats.max_queue_us.fetch_max(us, Ordering::Relaxed);
         self.stats.max_queued_frames.fetch_max(queued as u64, Ordering::Relaxed);
-        if queued >= 1024 && queued.is_power_of_two() {
+        if backlog_to_warn(queued, &mut self.backlog_warned) {
             warn!(conn = self.id, queued, "frame backlog growing");
         }
     }
@@ -1231,7 +1251,20 @@ impl Connection {
 
     /// Stops trusting the books of `symbols` and asks the exchange for fresh
     /// ones: unsubscribe now, subscribe again through the paced queue.
+    ///
+    /// A symbol already `resyncing` is skipped: its unsubscribe barrier is
+    /// unanswered, so whatever failed is old data (dropped anyway), and its
+    /// subscribe is queued or sent. With a sequence-numbered exchange every change
+    /// after a gap fails until then, and each must not start another resync.
+    /// Once the barrier is answered the symbol can be resynced again (e.g.
+    /// if its fresh book proves bad).
     async fn resync(&mut self, ws: &mut WsSink, symbols: &[String]) -> Result<(), Stop> {
+        let symbols: Vec<String> = symbols
+            .iter()
+            .filter(|s| !self.resyncing.contains_key(*s))
+            .cloned()
+            .collect();
+        let symbols = symbols.as_slice();
         if symbols.is_empty() {
             return Ok(());
         }
