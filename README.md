@@ -14,8 +14,9 @@ the SBE schema, generated DTOs, `AlignedSbeWriter`/`AlignedSbeReader` and
 
 ## Challenge coverage
 
-Every run below ended with `validate` = `CONSISTENT`, `receive time
-reversals` 0 and `updates without baseline` 0. The run artefacts (`.log`,
+Every run below except `diagA` ended with `validate` = `CONSISTENT`,
+`receive time reversals` 0 and `updates without baseline` 0 (`diagA` wrote
+to `/dev/null`, so there is no file to validate). The run artefacts (`.log`,
 `.validate`, `.mem`, `.info`) are in `~/runs/<name>.*` on the test host
 (WSL2); `python3 scripts/summarize.py ~/runs/<name>.log` regenerates a
 summary. "Mismatched" is `mismatched_books` per million levels (exchange
@@ -32,7 +33,7 @@ under [Evidence runs](#evidence-runs).
 | R6 | Deltas to stdout, a full snapshot every minute, with the template helpers | `PriceLevelUpdate` per change, `Snapshot` per book each minute, through `AlignedSbeWriter` ([Output format](#output-format)) | all runs |
 | R7 | On SIGINT close the websockets and the output file | Close frames, queue drained, file flushed, exit 0 ([Shutdown](#shutdown)) | every run ends with `output flushed and closed` |
 | Q1 | Data complete | Exchange books checked against the local book, resync on any loss ([Checkpoints](#design), [Redundancy](#redundancy), [Validating a file](#validating-a-file)) | `r2-25k-30m`: 0.71 mismatched; `e2-90m-25k`: 0.38; `full30g`: 3.1 but 395 disconnects (see below) |
-| Q2 | Data time-accurate | Receive stamp taken by a reader task when the frame is read, before parsing and queueing; per-token monotonic; exact minute snapshots ([Time stamps](#design)) | reversals 0 in all runs. Before the change (`full30e`) writer backpressure stalled reads for ~1 s; now reads never wait for the writer, so `queue_ms` is processing delay and the stamps are unaffected |
+| Q2 | Data time-accurate | Receive stamp taken by a reader task when the frame is read, before parsing and queueing; per-token monotonic; exact minute snapshots ([Time stamps](#design)) | Accuracy evidence: test `receive_times_do_not_wait_for_a_full_writer` (stamps within 50 ms of arrival while the writer is held full). Before the change (`full30e`) writer backpressure stalled reads for ~1 s. Reversals 0 in all validated runs proves ordering only, not accuracy. At full scale on this host the stamps are true receive times, but arrival itself is delayed by the link (PONGs up to 47.6 s late); `full30g` `max_queue` p50 1.1 s is processing delay, not stamp error. A starved reader task (CPU) could still delay stamps |
 | E1 | Redundant websockets, snapshot on source switch | `--redundancy` ([Redundancy](#redundancy)) | `e1-r1` / `e1-r2` (10k tokens, 30 min, two forced drops by iptables): R=2 switched source on each drop (`source lost its connection`), 3.70 mismatched vs 4.07 for R=1 |
 | E2 | Subscription monitoring, periodic socket recycling | Quiet-token check and `--recycle-hours` ([Subscription monitoring](#subscription-monitoring)) | `e2-90m-25k` (90 min, recycle every 15 min): 110 recycles, 0 skipped, 74 silent resyncs, 16,906 active symbols, 0.38 mismatched, 11 disconnects |
 | E3 | Generic encode/decode per exchange | `Exchange` / `Codec` / `BookApi` traits in `src/exchange/mod.rs`, Polymarket behind them ([Adding an exchange](#adding-an-exchange)). The second exchange is **test-only** (no Kalshi account): a mock with a different protocol, sequence numbers and signed deltas. Discovery stays per exchange (the `Poll` / `Tracker` interface) | tests in `src/ws/connection/tests.rs`: `a_second_exchange_records_books_and_deltas`, `a_sequence_gap_resyncs_the_symbol`, `a_negative_delta_resyncs_the_symbol`, `mock_exchange_makes_no_empty_guesses`, `deltas_after_a_gap_start_only_one_resync` |
@@ -43,11 +44,11 @@ under [Evidence runs](#evidence-runs).
 The full 30-minute run (`full30g`, `--redundancy 1`, 486k symbols) was
 consistent, with 3.1 mismatched books per million levels, a 1.16 GiB peak
 RSS and 18.4 GB/h of output. It also had 395 disconnects (255 with no
-`PONG`, 132 resets). They come from the test host's link, not from the
-collector:
+`PONG`, 132 resets). They are consistent with the test host's link cap,
+but the evidence is circumstantial:
 
-- The link measured ~3–5 MB/s in total (a CDN download: 3.0 MB/s over 6
-  streams). The collector received ~4.8–5.1 MB/s, so the link is the cap.
+- The link measured ~3–5 MB/s to a CDN (3.0 MB/s over 6 streams). The
+  collector received ~4.8–5.1 MB/s from Polymarket, which matches a link cap.
 - The market channel needs more than 5 MB/s even at half scale: `diagB`
   (240k tokens) received 5.15 MB/s and had 23 disconnects in 12 min. A
   smaller load fits: `r2-25k-30m` (50k tokens, R=2) used 2.9 MB/s and
@@ -55,7 +56,12 @@ collector:
 - Polymarket does not negotiate permessage-deflate, so the volume cannot
   be reduced on the client.
 - Output to `/dev/null` instead of a file (`diagA`) did not remove the
-  disconnects (66 in 11.8 min), so the disk path is not the main cause.
+  disconnects (66 in 11.8 min, ~5.6/min) but `full30g` had ~13/min, so the
+  disk/writer path may contribute.
+- `full30g` did not meet the plan's T1b thresholds: 255 no-`PONG`
+  disconnects and `max_queue_us` p99 2.3 s.
+- The redundancy run (`r2-25k-30m`) used 50k tokens, not full scale, because
+  R=2 at full scale needs twice the bandwidth.
 
 A disconnect costs a gap, handled as any reconnect (stale books,
 `gap_mismatched_books`); the file stays consistent. **Deployment
@@ -65,8 +71,9 @@ bandwidth for full scale at `--redundancy 1`, and about twice that at
 
 ### Evidence runs
 
-All runs use `scripts/run.sh <name> --duration <secs> -- <flags>` on commit
-`41671a7` or later. `--max-markets 25000` is 50k tokens.
+All runs except `diagA` use `scripts/run.sh <name> --duration <secs> --
+<flags>` on commit `41671a7` or later; `diagA` was run as `timeout -s INT 720
+~/runs/collector-41671a7 --redundancy 1 --recycle-hours 0 --output /dev/null`. `--max-markets 25000` is 50k tokens.
 
 | Run | Flags | Duration | Key result |
 | --- | --- | --- | --- |
@@ -288,8 +295,8 @@ With `--redundancy` above 1, a `shard source` line per shard follows:
 `source` (connection id writing now), `source_switches`, `lost_on_source` /
 `lost_on_peers` (changes a member never received, by hash, see
 Redundancy), `late_after_loss` and `late_after_loss_max_ms` (changes
-declared lost that arrived later after all: should be 0; otherwise the loss
-window is too short), `lag_p50_ms` / `lag_p99_ms` / `lag_samples` (how much
+declared lost that arrived later after all: ideally 0; observed values
+are in Known limitations), `lag_p50_ms` / `lag_p99_ms` / `lag_samples` (how much
 later the source receives a change than the first member that does, last
 30 s; negative = the source is ahead).
 
@@ -495,7 +502,7 @@ exchange supplies two things:
    `Event`s: `Book` (full book), `Level` (`LevelKind::Absolute` sets a
    quantity, `LevelKind::Delta` adds a signed change), `Pong` (the
    heartbeat's answer), `MarketAdded` / `MarketResolved`, `TickSizeChanged` (logged only),
-`Ignored`. A
+   `Ignored`. A
    message it cannot decode, or a **sequence gap**, is returned as a
    `Failure` naming its symbols; the connection then resyncs exactly those.
    Set `missing_book_means_empty` only if the exchange sends no book for a
@@ -558,12 +565,19 @@ Measured live in November 2026.
 - `--output -` writes through `/dev/stdout`: redirect with `>`, not `>>`.
 - Barriers assume the server answers each `PING` exactly once and in order.
   Once is verified (every `PING` answered exactly once, counted live, also
-  with 30 sockets on a saturated link); order is assumed. A lost `PONG`
-  would make every later barrier pass one `PING` late (safe, only slower);
-  an extra one would pass them early. The `PONG` timeout does not depend on
+  with 30 sockets on a saturated link); order is assumed. The `PING`s are
+  matched first-in first-out, so k lost `PONG`s make every later barrier
+  pass k `PING`s late (safe, only slower); an extra one would pass them
+  early. Under a saturated link a session whose first `PONG` is more than
+  30 s late is dropped at once (no `PONG` read yet, so the oldest-`PING`
+  rule applies), and each reconnect's book burst adds load. The `PONG` timeout does not depend on
   it. A `PONG` comes
   after every `book` sent before the `PING`, but it can overtake queued
   `price_change` data.
+- `late_after_loss` was not 0: 0–4 per shard (max ~32 s late) in
+  `r2-25k-30m`, and 228 in `e1-r2`, where the iptables blackhole makes TCP
+  retransmit late data after the loss was declared. The 30 s loss window is
+  slightly short under load.
 - After a failover to a lagging member, its switch snapshot can be seconds
   older than what the old source wrote; the following changes catch up,
   stamped no earlier than the switch.
