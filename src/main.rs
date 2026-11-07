@@ -27,6 +27,15 @@ use engineering_challenge::ws::connection::{ConnectionConfig, VerifyConfig};
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+// jemalloc's built-in options (its `malloc_conf` global, prefixed by
+// tikv-jemalloc-sys). `thp:never`: with transparent huge pages "always"
+// (the WSL2 default) a sparsely used 2 MB range of the heap costs a whole
+// huge page; at 25,000 markets RSS rose 438 -> 544 MB in 15 min with them
+// and stayed ~400-430 MB without (README "Memory"). `_RJEM_MALLOC_CONF`
+// still overrides it.
+#[unsafe(export_name = "_rjem_malloc_conf")]
+static MALLOC_CONF: Option<&u8> = Some(&b"thp:never\0"[0]);
+
 #[derive(Parser, Debug)]
 #[command(about = "Records Polymarket order books in the challenge's SBE format")]
 struct Args {
