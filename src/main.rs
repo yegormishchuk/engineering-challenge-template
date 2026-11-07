@@ -3,6 +3,7 @@
 //! SBE output goes to stdout (default) or `--output <path>`; logs and
 //! counters go to stderr. See `docs/SPEC.md`.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
@@ -14,7 +15,7 @@ use tracing_subscriber::EnvFilter;
 use chrono::Utc;
 use engineering_challenge::clock;
 use engineering_challenge::discovery::{self, Diff, Poll, PollerConfig, Tracker, TrackerConfig};
-use engineering_challenge::exchange::Event;
+use engineering_challenge::exchange::{Event, Polymarket};
 use engineering_challenge::shard::ShardManager;
 use engineering_challenge::writer::{self, Output};
 use engineering_challenge::ws::connection::{ConnectionConfig, VerifyConfig};
@@ -131,6 +132,7 @@ async fn main() -> anyhow::Result<()> {
     let (discovery_tx, mut discovery_rx) = mpsc::unbounded_channel::<Event>();
     let mut shards = ShardManager::new(
         ConnectionConfig {
+            exchange: Arc::new(Polymarket::default()),
             verify: (!args.no_verify_empty).then(|| VerifyConfig::polymarket(http.clone(), args.verify_rate)),
             ..ConnectionConfig::default()
         },

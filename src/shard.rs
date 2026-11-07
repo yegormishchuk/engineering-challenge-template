@@ -334,7 +334,7 @@ mod tests {
         let (_tx, ticks) = watch::channel(Utc::now());
         let shutdown = CancellationToken::new();
         let cfg = ConnectionConfig {
-            url: "ws://127.0.0.1:9".into(),
+            exchange: Arc::new(crate::exchange::Polymarket::with_url("ws://127.0.0.1:9")),
             ..ConnectionConfig::default()
         };
         (ShardManager::new(cfg, max, out, ticks, shutdown.clone(), None), handle, shutdown, dir)

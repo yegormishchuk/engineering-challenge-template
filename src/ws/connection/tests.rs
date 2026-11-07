@@ -25,7 +25,7 @@ const CHANGE_B: &str = r#"{"event_type":"price_change","market":"m","timestamp":
 
 fn fast_cfg(url: String) -> ConnectionConfig {
     ConnectionConfig {
-        url,
+        exchange: Arc::new(Polymarket::with_url(url)),
         ping_interval: Duration::from_millis(50),
         pong_timeout: Duration::from_secs(5),
         connect_timeout: Duration::from_secs(2),
@@ -722,11 +722,13 @@ async fn mock_books_http_with(
     (url, bodies)
 }
 
-fn verify_cfg(url: String) -> Option<VerifyConfig> {
+/// Points `cfg`'s exchange at the mock `POST /books` at `books_url` and
+/// returns fast verification settings.
+fn verify_cfg(cfg: &mut ConnectionConfig, books_url: String) -> Option<VerifyConfig> {
+    cfg.exchange = Arc::new(Polymarket::with_url(cfg.exchange.ws_url()).with_books_url(books_url));
     Some(VerifyConfig {
         http: reqwest::Client::new(),
         limiter: RateLimiter::per_second(1000.0),
-        url,
         batch: 200,
         every: Duration::from_millis(50),
         max_backoff: Duration::from_millis(200),
@@ -741,7 +743,7 @@ async fn rest_confirms_an_assumed_empty_book() {
     let (http_url, requests) = mock_books_http(&[]).await;
     let mut cfg = fast_cfg(ws_url);
     cfg.empty_book_after = Duration::from_millis(200);
-    cfg.verify = verify_cfg(http_url);
+    cfg.verify = verify_cfg(&mut cfg, http_url);
     let h = start(cfg, &["B"]);
     eventually("confirmed empty", || h.get(|s| &s.empty_confirmed) == 1).await;
     assert_eq!(h.get(|s| &s.empty_wrong), 0);
@@ -756,7 +758,7 @@ async fn rest_showing_orders_for_an_assumed_empty_book_triggers_a_resync() {
     let (http_url, _requests) = mock_books_http(&["B"]).await;
     let mut cfg = fast_cfg(ws_url);
     cfg.empty_book_after = Duration::from_millis(200);
-    cfg.verify = verify_cfg(http_url);
+    cfg.verify = verify_cfg(&mut cfg, http_url);
     let h = start(cfg, &["A", "B"]);
     eventually("wrong guess found", || h.get(|s| &s.empty_wrong) >= 1).await;
     eventually("unsubscribe + subscribe for B", || log.lock().unwrap().len() >= 3).await;
@@ -895,7 +897,7 @@ async fn repeated_wrong_empty_guesses_give_up() {
     let (http_url, _requests) = mock_books_http(&["B"]).await;
     let mut cfg = fast_cfg(ws_url);
     cfg.empty_book_after = Duration::from_millis(50);
-    cfg.verify = verify_cfg(http_url).map(|mut v| {
+    cfg.verify = verify_cfg(&mut cfg, http_url).map(|mut v| {
         v.give_up_after = 2;
         v
     });
@@ -924,7 +926,7 @@ async fn an_order_placed_after_a_correct_empty_guess_is_not_a_wrong_guess() {
     cfg.empty_book_after = Duration::from_millis(50);
     // REST sees the order ~300 ms before the stream does; the confirmation
     // window must be longer than that lead, as it is in production (5 s).
-    cfg.verify = verify_cfg(http_url).map(|mut v| {
+    cfg.verify = verify_cfg(&mut cfg, http_url).map(|mut v| {
         v.confirm_after = Duration::from_secs(1);
         v
     });
@@ -991,7 +993,7 @@ async fn a_rest_result_waits_until_the_stream_catches_up() {
     .await;
     let mut cfg = fast_cfg(ws_url);
     cfg.empty_book_after = Duration::from_millis(50);
-    cfg.verify = verify_cfg(http_url).map(|mut v| {
+    cfg.verify = verify_cfg(&mut cfg, http_url).map(|mut v| {
         v.confirm_after = Duration::from_millis(100);
         v
     });
@@ -1800,4 +1802,263 @@ async fn shutdown_writes_frames_already_read() {
     h.finish().await;
     drained.await.unwrap();
     assert_eq!(got.lock().unwrap().len(), 11, "{:?}", kinds(&got.lock().unwrap()));
+}
+
+// A second exchange (Extension 3), test-only, with a deliberately different
+// protocol: heartbeat `hb` → `hb-ack`; `{"op":"sub"|"unsub","syms":[..]}`;
+// frames are JSON arrays of `snap` (full book) and `delta` (signed change)
+// messages, each with a per-symbol sequence number.
+
+use crate::Side;
+use crate::exchange::{Capabilities, DecodeError, Decoded, Failure, LevelKind};
+use crate::fixed::parse_fixed;
+
+#[derive(Debug)]
+struct MockExchange {
+    url: String,
+}
+
+impl Exchange for MockExchange {
+    fn name(&self) -> &'static str {
+        "mock"
+    }
+
+    fn ws_url(&self) -> &str {
+        &self.url
+    }
+
+    fn ping_text(&self) -> &str {
+        "hb"
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            missing_book_means_empty: false,
+        }
+    }
+
+    fn codec(&self) -> Box<dyn Codec> {
+        Box::new(MockCodec::default())
+    }
+}
+
+#[derive(Default)]
+struct MockCodec {
+    /// Last sequence number per symbol: set by a `snap`, cleared by a gap
+    /// (later deltas fail until the next `snap`).
+    last: HashMap<String, u64>,
+}
+
+fn mock_op(op: &str, symbols: &[String]) -> String {
+    serde_json::json!({ "op": op, "syms": symbols }).to_string()
+}
+
+impl Codec for MockCodec {
+    fn encode_initial_subscribe(&mut self, symbols: &[String]) -> String {
+        mock_op("sub", symbols)
+    }
+
+    fn encode_subscribe(&mut self, symbols: &[String]) -> String {
+        mock_op("sub", symbols)
+    }
+
+    fn encode_unsubscribe(&mut self, symbols: &[String]) -> String {
+        mock_op("unsub", symbols)
+    }
+
+    fn decode(&mut self, text: &str) -> Result<Decoded, DecodeError> {
+        let mut out = Decoded::default();
+        if text == "hb-ack" {
+            out.events.push(Event::Pong);
+            return Ok(out);
+        }
+        let items: Vec<serde_json::Value> = serde_json::from_str(text).map_err(DecodeError::Json)?;
+        let fixed = |v: &serde_json::Value| parse_fixed(v.as_str().unwrap()).unwrap();
+        for m in items {
+            let symbol = m["s"].as_str().unwrap().to_owned();
+            let seq = m["seq"].as_u64().unwrap();
+            let exchange_ts = DateTime::from_timestamp_millis(m["ts"].as_i64().unwrap()).unwrap();
+            match m["k"].as_str().unwrap() {
+                "snap" => {
+                    let side = |k: &str| -> Vec<(i64, i64)> {
+                        m[k].as_array().unwrap().iter().map(|l| (fixed(&l[0]), fixed(&l[1]))).collect()
+                    };
+                    self.last.insert(symbol.clone(), seq);
+                    out.events.push(Event::Book {
+                        bids: side("bids"),
+                        asks: side("asks"),
+                        symbol,
+                        exchange_ts,
+                        hash: None,
+                    });
+                }
+                "delta" => match self.last.get(&symbol).copied() {
+                    Some(last) if seq == last + 1 => {
+                        self.last.insert(symbol.clone(), seq);
+                        out.events.push(Event::Level {
+                            side: if m["side"] == "bid" { Side::Buy } else { Side::Sell },
+                            price: fixed(&m["px"]),
+                            quantity: fixed(&m["dq"]),
+                            kind: LevelKind::Delta,
+                            symbol,
+                            exchange_ts,
+                            hash: None,
+                        });
+                    }
+                    last => {
+                        self.last.remove(&symbol);
+                        out.failures.push(Failure {
+                            kind: "delta",
+                            symbols: vec![symbol],
+                            error: DecodeError::Sequence {
+                                expected: last.map_or(0, |l| l + 1),
+                                got: seq,
+                            },
+                        });
+                    }
+                },
+                other => out.events.push(Event::Ignored { kind: other.to_owned() }),
+            }
+        }
+        Ok(out)
+    }
+}
+
+fn mock_cfg(url: String) -> ConnectionConfig {
+    ConnectionConfig {
+        exchange: Arc::new(MockExchange { url }),
+        ..fast_cfg(String::new())
+    }
+}
+
+fn mock_snap(seq: u64, bid: &str) -> String {
+    format!(r#"[{{"k":"snap","s":"A","seq":{seq},"ts":1793822781000,"bids":[["0.40","{bid}"]],"asks":[]}}]"#)
+}
+
+fn mock_delta(seq: u64, dq: &str) -> String {
+    format!(r#"[{{"k":"delta","s":"A","seq":{seq},"ts":1793822781001,"side":"bid","px":"0.40","dq":"{dq}"}}]"#)
+}
+
+/// Reads one client text frame of the mock protocol, answering `hb` on the
+/// way. Logs every text, heartbeats included.
+async fn mock_next(ws: &mut ServerWs, log: &Mutex<Vec<String>>) -> Option<String> {
+    while let Some(Ok(msg)) = ws.next().await {
+        if let Message::Text(t) = msg {
+            let t = t.to_string();
+            log.lock().unwrap().push(t.clone());
+            if t == "hb" {
+                ws.send(Message::text("hb-ack")).await.ok()?;
+                continue;
+            }
+            return Some(t);
+        }
+    }
+    None
+}
+
+async fn mock_idle(mut ws: ServerWs, log: Arc<Mutex<Vec<String>>>) {
+    while mock_next(&mut ws, &log).await.is_some() {}
+}
+
+/// The client's texts other than heartbeats, as JSON.
+fn mock_ops(log: &Mutex<Vec<String>>) -> Vec<serde_json::Value> {
+    let log = log.lock().unwrap();
+    log.iter()
+        .filter(|t| t.as_str() != "hb")
+        .map(|t| serde_json::from_str(t).unwrap_or_else(|_| panic!("not mock protocol: {t:?}")))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_second_exchange_records_books_and_deltas() {
+    let (url, log) = mock_server(|_, mut ws, log| async move {
+        mock_next(&mut ws, &log).await; // subscribe
+        send(&mut ws, &mock_snap(1, "10")).await;
+        send(&mut ws, &mock_delta(2, "5")).await;
+        send(&mut ws, &mock_delta(3, "-3")).await;
+        mock_idle(ws, log).await;
+    })
+    .await;
+    let h = start(mock_cfg(url), &["A"]);
+    eventually("both deltas applied", || h.get(|s| &s.levels) == 2).await;
+    assert_eq!(mock_ops(&log), [serde_json::json!({"op":"sub","syms":["A"]})]);
+    assert!(log.lock().unwrap().iter().any(|t| t == "hb"), "the exchange's heartbeat is used");
+    assert_eq!(h.get(|s| &s.ignored), 0, "every heartbeat answer decoded as a PONG");
+    let msgs = h.finish().await;
+    assert_eq!(kinds(&msgs), ["S:A", "U:A:15000000", "U:A:12000000"], "absolute quantities");
+}
+
+#[tokio::test]
+async fn a_sequence_gap_resyncs_the_symbol() {
+    let (url, log) = mock_server(|_, mut ws, log| async move {
+        mock_next(&mut ws, &log).await; // subscribe
+        send(&mut ws, &mock_snap(1, "10")).await;
+        send(&mut ws, &mock_delta(2, "-4")).await;
+        send(&mut ws, &mock_delta(4, "1")).await; // 3 is missing
+        mock_next(&mut ws, &log).await; // unsubscribe
+        mock_next(&mut ws, &log).await; // subscribe again
+        send(&mut ws, &mock_snap(10, "7")).await;
+        send(&mut ws, &mock_delta(11, "2")).await;
+        mock_idle(ws, log).await;
+    })
+    .await;
+    let h = start(mock_cfg(url), &["A"]);
+    eventually("delta after the new snap applied", || h.get(|s| &s.levels) == 2).await;
+    assert_eq!(h.get(|s| &s.resyncs), 1);
+    assert_eq!(h.get(|s| &s.decode_errors), 1);
+    assert_eq!(
+        mock_ops(&log),
+        [
+            serde_json::json!({"op":"sub","syms":["A"]}),
+            serde_json::json!({"op":"unsub","syms":["A"]}),
+            serde_json::json!({"op":"sub","syms":["A"]}),
+        ]
+    );
+    let msgs = h.finish().await;
+    assert_eq!(kinds(&msgs), ["S:A", "U:A:6000000", "S:A", "U:A:9000000"], "seq 4 not written");
+}
+
+#[tokio::test]
+async fn a_negative_delta_resyncs_the_symbol() {
+    let (url, log) = mock_server(|_, mut ws, log| async move {
+        mock_next(&mut ws, &log).await; // subscribe
+        send(&mut ws, &mock_snap(1, "10")).await;
+        send(&mut ws, &mock_delta(2, "-15")).await; // 10 - 15 < 0: a change was missed
+        mock_next(&mut ws, &log).await; // unsubscribe
+        mock_next(&mut ws, &log).await; // subscribe again
+        send(&mut ws, &mock_snap(5, "3")).await;
+        send(&mut ws, &mock_delta(6, "1")).await;
+        mock_idle(ws, log).await;
+    })
+    .await;
+    let h = start(mock_cfg(url), &["A"]);
+    eventually("delta after the new snap applied", || h.get(|s| &s.levels) == 1).await;
+    assert_eq!(h.get(|s| &s.resyncs), 1);
+    assert_eq!(
+        mock_ops(&log),
+        [
+            serde_json::json!({"op":"sub","syms":["A"]}),
+            serde_json::json!({"op":"unsub","syms":["A"]}),
+            serde_json::json!({"op":"sub","syms":["A"]}),
+        ]
+    );
+    let msgs = h.finish().await;
+    assert_eq!(kinds(&msgs), ["S:A", "S:A", "U:A:4000000"], "the negative delta is not written");
+}
+
+#[tokio::test]
+async fn mock_exchange_makes_no_empty_guesses() {
+    let (url, log) = mock_server(|_, ws, log| mock_idle(ws, log)).await;
+    let mut cfg = mock_cfg(url);
+    cfg.empty_book_after = Duration::from_millis(100);
+    let h = start(cfg, &["A"]);
+    // The subscription's barrier and later heartbeats are answered: with
+    // Polymarket, A would now be assumed empty.
+    eventually("heartbeats answered", || {
+        log.lock().unwrap().iter().filter(|t| t.as_str() == "hb").count() >= 4
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(h.get(|s| &s.assumed_empty), 0);
+    assert!(h.finish().await.is_empty(), "no assumed-empty snapshot");
 }

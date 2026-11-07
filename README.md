@@ -244,6 +244,12 @@ the end markets the pass did not list are removed, except ones changed after
 the pass began. A pass listing under half the tracked markets removes
 nothing.
 
+**Exchange layer.** Only `src/exchange/` knows Polymarket. The core
+(connections, books, shards, writer) speaks to it through the `Exchange`
+trait (URL, heartbeat text, capabilities, a per-socket `Codec`, optional
+REST book check) and sees only normalized `Event`s. See
+[Adding an exchange](#adding-an-exchange).
+
 **Sharding.** Each token is assigned to the least-loaded connection with
 room (≤ `--max-per-connection`); a new connection opens when all are full.
 A connection owns its tokens' books and is the only producer of their
@@ -372,6 +378,45 @@ a socket it has been serving for hours. Two mechanisms handle that, at every
   recycle is skipped until the next round. With `--redundancy 1` there is
   no peer: a recycle is a short gap, recorded like any reconnect (stale
   books, `gap_mismatched_books`).
+
+## Adding an exchange
+
+The service is generic over the websocket layer (Extension 3). A second
+exchange supplies two things:
+
+1. **An `Exchange` impl** (`src/exchange/mod.rs`): `ws_url`, `ping_text`
+   (the application heartbeat), `capabilities`, `codec()` and optionally
+   `book_api()`. The `Codec`, one per socket so it can keep state, encodes
+   subscribe / unsubscribe messages and decodes each text frame into
+   `Event`s: `Book` (full book), `Level` (`LevelKind::Absolute` sets a
+   quantity, `LevelKind::Delta` adds a signed change), `Pong` (the
+   heartbeat's answer), `MarketAdded` / `MarketResolved`, `Ignored`. A
+   message it cannot decode, or a **sequence gap**, is returned as a
+   `Failure` naming its symbols; the connection then resyncs exactly those.
+   Set `missing_book_means_empty` only if the exchange sends no book for a
+   symbol without orders (Polymarket): it enables the empty-book guesses,
+   checked over REST if `book_api()` is given. Pass the impl as
+   `ConnectionConfig::exchange` in `main.rs`.
+2. **A discovery poller** that sends `Poll`s to the `Tracker` (as
+   `discovery.rs` does with Polymarket's Gamma API). Discovery is
+   exchange-specific; the core only sees market adds and removals.
+
+**Requirement:** the server must answer each heartbeat in order, after every
+frame it sent before receiving it. Every barrier relies on this (see
+Design). An exchange whose heartbeat cannot do this needs another barrier.
+
+The core then gives, unchanged: sharding over connections, pacing,
+reconnects and resyncs with stale-book comparison, the output timestamps
+and `AlignedSbeWriter` output (the replay rule is the same: every
+`PriceLevelUpdate` carries the resulting absolute quantity, also for
+deltas, and a delta below zero resyncs the symbol), minute snapshots,
+redundancy, quiet-token monitoring, recycling, counters and validation.
+Redundant loss and lag detection compare the optional `hash` of each event;
+without hashes the source changes only when its connection drops.
+
+The tests (`src/ws/connection/tests.rs`) plug in a mock second exchange with
+a different protocol: `hb` / `hb-ack` heartbeats, `{"op":"sub",...}`
+messages, per-symbol sequence numbers and signed deltas.
 
 ## Measured limits
 

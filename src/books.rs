@@ -21,6 +21,7 @@ use chrono::{DateTime, Utc};
 
 use crate::Side;
 use crate::book::{BookError, LevelMismatch, OrderBook, level_update};
+use crate::exchange::LevelKind;
 use crate::writer::OutMsg;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -235,14 +236,18 @@ impl Books {
         })
     }
 
-    /// Applies one level change (absolute quantity, `0` removes) and returns
-    /// the `PriceLevelUpdate` to write. On error nothing changes.
+    /// Applies one level change and returns the `PriceLevelUpdate` to write,
+    /// always with the resulting absolute quantity (`0` removes the level).
+    /// A [`LevelKind::Delta`] adds to the current quantity (a missing level
+    /// is 0); a result below 0 is an error. On error nothing changes.
+    #[allow(clippy::too_many_arguments)]
     pub fn apply_level(
         &mut self,
         symbol: &str,
         side: Side,
         price: i64,
         quantity: i64,
+        kind: LevelKind,
         exchange_ts: DateTime<Utc>,
         received_at: DateTime<Utc>,
     ) -> Result<OutMsg, BooksError> {
@@ -253,6 +258,16 @@ impl Books {
             return Err(no_baseline());
         }
         let entry = self.books.get_mut(symbol).ok_or_else(no_baseline)?;
+        let quantity = match kind {
+            LevelKind::Absolute => quantity,
+            LevelKind::Delta => {
+                let levels = match side {
+                    Side::Buy => entry.book.bids(),
+                    Side::Sell => entry.book.asks(),
+                };
+                levels.get(&price).copied().unwrap_or(0).saturating_add(quantity)
+            }
+        };
         entry
             .book
             .set_level(side, price, quantity, exchange_ts)
@@ -356,7 +371,7 @@ mod tests {
     fn later_snapshot_reports_mismatches() {
         let mut books = Books::new();
         books.apply_snapshot("T", [(100, 1)], [], ts(1), ts(1)).unwrap();
-        books.apply_level("T", Side::Buy, 100, 5, ts(2), ts(2)).unwrap();
+        books.apply_level("T", Side::Buy, 100, 5, LevelKind::Absolute, ts(2), ts(2)).unwrap();
         let clean = books.apply_snapshot("T", [(100, 5)], [], ts(3), ts(3)).unwrap();
         assert_eq!(clean.mismatches, Some(vec![]));
         let dirty = books.apply_snapshot("T", [(100, 6)], [], ts(4), ts(4)).unwrap();
@@ -368,7 +383,7 @@ mod tests {
     fn level_change_uses_receive_time_as_backtest_timestamp() {
         let mut books = Books::new();
         books.apply_snapshot("T", [], [], ts(1), ts(1)).unwrap();
-        let OutMsg::Update(u) = books.apply_level("T", Side::Sell, 300, 7, ts(20), ts(21)).unwrap()
+        let OutMsg::Update(u) = books.apply_level("T", Side::Sell, 300, 7, LevelKind::Absolute, ts(20), ts(21)).unwrap()
         else {
             panic!()
         };
@@ -380,7 +395,7 @@ mod tests {
     fn level_change_without_baseline_is_rejected() {
         let mut books = Books::new();
         assert_eq!(
-            books.apply_level("T", Side::Buy, 1, 1, ts(1), ts(1)),
+            books.apply_level("T", Side::Buy, 1, 1, LevelKind::Absolute, ts(1), ts(1)),
             Err(BooksError::NoBaseline { symbol: "T".into() })
         );
         assert!(books.is_empty());
@@ -390,10 +405,43 @@ mod tests {
     fn invalid_change_leaves_book_unchanged() {
         let mut books = Books::new();
         books.apply_snapshot("T", [(100, 1)], [], ts(1), ts(1)).unwrap();
-        assert!(books.apply_level("T", Side::Buy, 100, -1, ts(2), ts(2)).is_err());
+        assert!(books.apply_level("T", Side::Buy, 100, -1, LevelKind::Absolute, ts(2), ts(2)).is_err());
         assert!(books.apply_snapshot("T", [(100, -1)], [], ts(3), ts(3)).is_err());
         let book = books.get("T").unwrap();
         assert_eq!(book.bids().get(&100), Some(&1));
+        assert_eq!(book.last_exchange_ts(), Some(ts(1)));
+    }
+
+    fn quantity(msg: OutMsg) -> i64 {
+        let OutMsg::Update(u) = msg else { panic!("{msg:?}") };
+        u.quantity
+    }
+
+    #[test]
+    fn delta_levels_add_to_the_current_quantity() {
+        let mut books = Books::new();
+        books.apply_snapshot("T", [(100, 10)], [], ts(1), ts(1)).unwrap();
+        let up = books.apply_level("T", Side::Buy, 100, 5, LevelKind::Delta, ts(2), ts(2)).unwrap();
+        assert_eq!(quantity(up), 15, "written as the absolute quantity");
+        assert_eq!(books.get("T").unwrap().bids().get(&100), Some(&15));
+        let gone = books.apply_level("T", Side::Buy, 100, -15, LevelKind::Delta, ts(3), ts(3)).unwrap();
+        assert_eq!(quantity(gone), 0);
+        assert!(books.get("T").unwrap().bids().is_empty(), "0 removes the level");
+        // A missing level counts as 0.
+        let new = books.apply_level("T", Side::Sell, 200, 3, LevelKind::Delta, ts(4), ts(4)).unwrap();
+        assert_eq!(quantity(new), 3);
+    }
+
+    #[test]
+    fn a_delta_below_zero_is_rejected_and_leaves_the_book() {
+        let mut books = Books::new();
+        books.apply_snapshot("T", [(100, 10)], [], ts(1), ts(1)).unwrap();
+        assert!(matches!(
+            books.apply_level("T", Side::Buy, 100, -11, LevelKind::Delta, ts(2), ts(2)),
+            Err(BooksError::Book { error: BookError::NegativeQuantity { .. }, .. })
+        ));
+        let book = books.get("T").unwrap();
+        assert_eq!(book.bids().get(&100), Some(&10));
         assert_eq!(book.last_exchange_ts(), Some(ts(1)));
     }
 
@@ -402,7 +450,7 @@ mod tests {
         let mut books = Books::new();
         books.apply_snapshot("B", [(1, 1)], [], ts(5), ts(6)).unwrap();
         books.apply_snapshot("A", [], [(2, 2)], ts(7), ts(8)).unwrap();
-        books.apply_level("A", Side::Sell, 2, 3, ts(9), ts(10)).unwrap();
+        books.apply_level("A", Side::Sell, 2, 3, LevelKind::Absolute, ts(9), ts(10)).unwrap();
 
         let snaps: Vec<OutMsg> = books.minute_snapshots(ts(60_000)).collect();
         let summary: Vec<_> = snaps
@@ -423,7 +471,7 @@ mod tests {
         books.mark_all_stale();
         assert!(!books.has_baseline("T"));
         assert!(matches!(
-            books.apply_level("T", Side::Buy, 100, 2, ts(2), ts(2)),
+            books.apply_level("T", Side::Buy, 100, 2, LevelKind::Absolute, ts(2), ts(2)),
             Err(BooksError::NoBaseline { .. })
         ));
         assert!(books.minute_snapshots(ts(3)).next().is_none(), "stale books are not snapshotted");

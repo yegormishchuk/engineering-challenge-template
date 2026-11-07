@@ -1,4 +1,7 @@
-//! One websocket connection to the Polymarket market channel.
+//! One websocket connection to an exchange's market channel. Everything
+//! exchange-specific (URL, heartbeat text, message formats, REST checks)
+//! comes from [`ConnectionConfig::exchange`]; `PING`/`PONG` below stand for
+//! the exchange's heartbeat and its answer.
 //!
 //! A connection owns the books of its symbols and is the only writer of
 //! their messages, so books and output stay consistent without locks. It
@@ -9,7 +12,7 @@
 //! | --- | --- |
 //! | socket closed, error, or no `PONG` read for `pong_timeout` after a `PING` | reconnect; mark all books stale; resubscribe everything |
 //! | frame that looks like JSON but does not parse | mark all books stale; unsubscribe + subscribe everything |
-//! | `book` / `price_change` that does not decode | the same, for the symbols it names (all if none) |
+//! | `book` / `price_change` that does not decode, or a sequence gap | the same, for the symbols it names (all if none) |
 //! | invalid level change or book for a symbol | the same, for that symbol |
 //! | REST shows orders for a book assumed empty | the same, for that symbol |
 //!
@@ -19,7 +22,8 @@
 //! A stale book (from before a gap) is not a baseline, but it is compared
 //! with that next book and the result is counted as `gap_mismatched_books`.
 //!
-//! Polymarket sends no `book` for a token without orders, so a symbol still
+//! Polymarket sends no `book` for a token without orders
+//! ([`missing_book_means_empty`](crate::exchange::Capabilities::missing_book_means_empty)), so a symbol still
 //! without one gets an empty baseline, and the guess is checked against the
 //! batch REST endpoint. The guess must not depend on how fast we read: under
 //! load a book can sit unread in the socket long after it was sent. So it is
@@ -47,7 +51,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::books::{Books, BooksError, SilenceConfig, SnapshotApplied};
-use crate::exchange::{Event, polymarket};
+use crate::exchange::{Codec, Event, Exchange, Polymarket, RestBook};
 use crate::writer::{OutMsg, OutSender, WriterGone};
 use crate::ws::source::{ShardSource, State as SourceState};
 
@@ -88,7 +92,6 @@ pub struct VerifyConfig {
     pub http: reqwest::Client,
     /// Shared by all connections; see [`RateLimiter`].
     pub limiter: Arc<RateLimiter>,
-    pub url: String,
     /// Symbols per request.
     pub batch: usize,
     /// At most one request in flight per connection, at most this often.
@@ -110,7 +113,6 @@ impl VerifyConfig {
         Self {
             http,
             limiter: RateLimiter::per_second(requests_per_second),
-            url: polymarket::BOOKS_URL.to_owned(),
             batch: 200,
             every: Duration::from_secs(2),
             max_backoff: Duration::from_secs(60),
@@ -122,7 +124,8 @@ impl VerifyConfig {
 
 #[derive(Debug, Clone)]
 pub struct ConnectionConfig {
-    pub url: String,
+    /// The exchange spoken on the socket: URL, heartbeat, codec, REST checks.
+    pub exchange: Arc<dyn Exchange>,
     pub ping_interval: Duration,
     pub pong_timeout: Duration,
     pub connect_timeout: Duration,
@@ -164,7 +167,7 @@ pub struct ConnectionConfig {
 impl Default for ConnectionConfig {
     fn default() -> Self {
         Self {
-            url: polymarket::WS_URL.to_owned(),
+            exchange: Arc::new(Polymarket::default()),
             ping_interval: Duration::from_secs(10),
             pong_timeout: Duration::from_secs(30),
             connect_timeout: Duration::from_secs(10),
@@ -266,7 +269,7 @@ fn add(counter: &AtomicU64, n: usize) {
 /// Result of one REST check of assumed-empty books.
 struct Verified {
     checked: Vec<String>,
-    result: Result<HashMap<String, polymarket::RestBook>, String>,
+    result: Result<HashMap<String, RestBook>, String>,
 }
 
 /// Levels as `(side is bid, price, quantity)`, for comparing books.
@@ -308,6 +311,8 @@ pub struct Connection {
     /// after its cut-off: the next one to handle.
     held: Option<Frame>,
     cfg: ConnectionConfig,
+    /// The current socket's codec; a fresh one per session.
+    codec: Box<dyn Codec>,
     /// In the order they were added, so a market's tokens (added together)
     /// stay in the same subscription batch after a reconnect.
     symbols: IndexSet<String>,
@@ -401,6 +406,7 @@ impl Connection {
             frame_at: std::time::Instant::now(),
             clock: RecvClock::new(),
             held: None,
+            codec: cfg.exchange.codec(),
             cfg,
             symbols: IndexSet::new(),
             books: Books::new(),
@@ -607,7 +613,7 @@ impl Connection {
 
             let connect = tokio::time::timeout(
                 self.cfg.connect_timeout,
-                tokio_tungstenite::connect_async(self.cfg.url.as_str()),
+                tokio_tungstenite::connect_async(self.cfg.exchange.ws_url()),
             );
             let connected = tokio::select! {
                 _ = shutdown.cancelled() => return Ok(()),
@@ -701,7 +707,7 @@ impl Connection {
 
     /// Sends a `PING` and returns its number.
     async fn send_ping(&mut self, ws: &mut WsSink) -> Result<u64, String> {
-        self.ws_send(ws, polymarket::PING.to_owned()).await?;
+        self.ws_send(ws, self.cfg.exchange.ping_text().to_owned()).await?;
         let n = self.next_ping;
         self.next_ping += 1;
         self.pings.push_back((n, std::time::Instant::now()));
@@ -759,6 +765,7 @@ impl Connection {
         shutdown: &CancellationToken,
     ) -> Result<SessionEnd, WriterGone> {
         self.pending = self.symbols.iter().cloned().collect();
+        self.codec = self.cfg.exchange.codec();
         self.initial_sent = false;
         self.awaiting_book.clear();
         self.pings.clear();
@@ -775,6 +782,7 @@ impl Connection {
             .cfg
             .empty_book_after
             .clamp(Duration::from_millis(10), Duration::from_secs(1));
+        let guess_empty = self.guesses_empty();
         let mut empty_check = tokio::time::interval(empty_every);
         empty_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // The first tick is immediate, so the first batch goes out at once.
@@ -837,7 +845,7 @@ impl Connection {
                         return Ok(SessionEnd::Lost(reason));
                     }
                 }
-                _ = empty_check.tick(), if !self.awaiting_book.is_empty() => {
+                _ = empty_check.tick(), if guess_empty && !self.awaiting_book.is_empty() => {
                     let t = self.clock.stamp();
                     if let Some(end) = self.catch_up(ws, rx, t).await? {
                         return Ok(end);
@@ -1027,7 +1035,7 @@ impl Connection {
         text: &str,
         received_at: DateTime<Utc>,
     ) -> Result<(), Stop> {
-        let decoded = match polymarket::decode(text) {
+        let decoded = match self.codec.decode(text) {
             Ok(decoded) => decoded,
             Err(error) => {
                 // Looked like JSON but did not parse: it may have held book
@@ -1121,6 +1129,7 @@ impl Connection {
                 side,
                 price,
                 quantity,
+                kind,
                 exchange_ts,
                 hash,
             } => {
@@ -1134,10 +1143,11 @@ impl Connection {
                 if !self.books.has_baseline(&symbol) {
                     let margin = chrono::TimeDelta::from_std(self.cfg.empty_book_on_change_after)
                         .unwrap_or(chrono::TimeDelta::MAX);
-                    let overdue = self
-                        .awaiting_book
-                        .get(&symbol)
-                        .is_some_and(|(_, sent_at, _)| exchange_ts >= *sent_at + margin);
+                    let overdue = self.guesses_empty()
+                        && self
+                            .awaiting_book
+                            .get(&symbol)
+                            .is_some_and(|(_, sent_at, _)| exchange_ts >= *sent_at + margin);
                     if !overdue {
                         inc(&self.stats.skipped_no_baseline);
                         return Ok(());
@@ -1146,7 +1156,7 @@ impl Connection {
                     // never comes after the change that depends on it.
                     self.assume_empty(&symbol, received_at).await?;
                 }
-                match self.books.apply_level(&symbol, side, price, quantity, exchange_ts, received_at) {
+                match self.books.apply_level(&symbol, side, price, quantity, kind, exchange_ts, received_at) {
                     Ok(msg) => {
                         inc(&self.stats.levels);
                         self.books.note_activity(&symbol, self.frame_at, &self.cfg.silence);
@@ -1267,9 +1277,9 @@ impl Connection {
             self.awaiting_book.insert(s.clone(), (now, now_utc, barrier));
         }
         let msg = if self.initial_sent {
-            polymarket::encode_subscribe(&batch)
+            self.codec.encode_subscribe(&batch)
         } else {
-            polymarket::encode_initial_subscribe(&batch)
+            self.codec.encode_initial_subscribe(&batch)
         };
         self.initial_sent = true;
         self.ws_send(ws, msg).await?;
@@ -1280,9 +1290,18 @@ impl Connection {
         Ok(())
     }
 
+    /// Whether a symbol may be given an empty baseline when no book comes:
+    /// only if the exchange sends no book for a symbol without orders.
+    fn guesses_empty(&self) -> bool {
+        self.cfg.exchange.capabilities().missing_book_means_empty
+    }
+
     /// Gives every symbol whose `book` is overdue an empty baseline and
     /// writes it as a snapshot stamped `at`.
     async fn assume_empty_books(&mut self, at: DateTime<Utc>) -> Result<(), WriterGone> {
+        if !self.guesses_empty() {
+            return Ok(());
+        }
         let grace = self.cfg.empty_book_after;
         let Some(acked) = self.acked_through else {
             return Ok(());
@@ -1318,7 +1337,8 @@ impl Connection {
         self.books.note_activity(symbol, std::time::Instant::now(), &self.cfg.silence);
         self.assumed.insert(symbol.to_owned());
         self.note_mismatches(symbol, &applied);
-        if self.cfg.verify.is_some() && !self.gave_up.contains(symbol) {
+        let checkable = self.cfg.verify.is_some() && self.cfg.exchange.book_api().is_some();
+        if checkable && !self.gave_up.contains(symbol) {
             self.to_verify.push(symbol.to_owned());
         }
         self.emit(applied.msg).await
@@ -1330,9 +1350,13 @@ impl Connection {
         let Some(verify) = self.cfg.verify.clone() else {
             return;
         };
+        let exchange = Arc::clone(&self.cfg.exchange);
+        let Some(api) = exchange.book_api() else {
+            return;
+        };
         let n = self.to_verify.len().min(verify.batch);
         let checked: Vec<String> = self.to_verify.drain(..n).collect();
-        let body = polymarket::encode_books_request(&checked);
+        let (url, body) = (api.url().to_owned(), api.encode_request(&checked));
         // The work runs in an inner task so that the outer one always
         // reports back, even if the work panics; otherwise `verify_in_flight`
         // would stay set and checks would stop for the session.
@@ -1341,7 +1365,7 @@ impl Connection {
                 verify.limiter.acquire().await;
                 let resp = verify
                     .http
-                    .post(&verify.url)
+                    .post(&url)
                     .header("Content-Type", "application/json")
                     .body(body)
                     .send()
@@ -1352,7 +1376,8 @@ impl Connection {
                 if !status.is_success() {
                     return Err(format!("HTTP {status}"));
                 }
-                polymarket::parse_books_response(&body).map_err(|e| e.to_string())
+                let api = exchange.book_api().expect("checked before the request");
+                api.parse_response(&body).map_err(|e| e.to_string())
             });
             let result = match work.await {
                 Ok(result) => result,
@@ -1470,12 +1495,13 @@ impl Connection {
 
     /// Unsubscribes at once (no book burst follows). Nothing to do before the
     /// socket's first subscription.
-    async fn send_unsubscribe(&self, ws: &mut WsSink, symbols: &[String]) -> Result<(), String> {
+    async fn send_unsubscribe(&mut self, ws: &mut WsSink, symbols: &[String]) -> Result<(), String> {
         if !self.initial_sent {
             return Ok(());
         }
         for chunk in symbols.chunks(self.cfg.subscribe_batch) {
-            self.ws_send(ws, polymarket::encode_unsubscribe(chunk)).await?;
+            let msg = self.codec.encode_unsubscribe(chunk);
+            self.ws_send(ws, msg).await?;
         }
         Ok(())
     }

@@ -15,9 +15,10 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::Event;
+pub use super::{DecodeError, Decoded, Failure, RestBook};
+use super::{BookApi, Capabilities, Codec, Event, Exchange, LevelKind};
 use crate::Side;
-use crate::fixed::{ParseFixedError, parse_fixed};
+use crate::fixed::parse_fixed;
 
 pub const WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
 
@@ -54,13 +55,6 @@ pub fn encode_books_request(symbols: &[String]) -> String {
     Value::Array(symbols.iter().map(|s| json!({ "token_id": s })).collect()).to_string()
 }
 
-/// One book from a [`BOOKS_URL`] response, in fixed point.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RestBook {
-    pub bids: Vec<(i64, i64)>,
-    pub asks: Vec<(i64, i64)>,
-}
-
 /// Parses a [`BOOKS_URL`] response into the books that have at least one
 /// level, by symbol. Tokens without orders are absent from the response.
 ///
@@ -94,45 +88,6 @@ pub fn parse_books_response(body: &str) -> Result<std::collections::HashMap<Stri
         }
     }
     Ok(out)
-}
-
-#[derive(Debug)]
-pub enum DecodeError {
-    Json(serde_json::Error),
-    Number { field: &'static str, error: ParseFixedError },
-    Timestamp(String),
-    Side(String),
-}
-
-impl std::fmt::Display for DecodeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Json(e) => write!(f, "bad JSON: {e}"),
-            Self::Number { field, error } => write!(f, "{field}: {error}"),
-            Self::Timestamp(s) => write!(f, "bad timestamp {s:?}"),
-            Self::Side(s) => write!(f, "unknown side {s:?}"),
-        }
-    }
-}
-
-impl std::error::Error for DecodeError {}
-
-/// A `book` or `price_change` message that could not be decoded.
-#[derive(Debug)]
-pub struct Failure {
-    pub kind: &'static str,
-    /// The symbols the message was about, as far as they could be read;
-    /// empty if unknown.
-    pub symbols: Vec<String>,
-    pub error: DecodeError,
-}
-
-/// Everything decoded from one frame. Messages are independent, so the good
-/// ones are kept even when another message of the frame fails.
-#[derive(Debug, Default)]
-pub struct Decoded {
-    pub events: Vec<Event>,
-    pub failures: Vec<Failure>,
 }
 
 #[derive(Deserialize)]
@@ -242,6 +197,7 @@ fn price_change(item: Value) -> Result<Vec<Event>, DecodeError> {
                 side: side(&c.side)?,
                 price: number("price", &c.price)?,
                 quantity: number("size", &c.size)?,
+                kind: LevelKind::Absolute,
                 symbol: c.asset_id,
                 exchange_ts,
                 hash: c.hash,
@@ -329,6 +285,98 @@ pub fn decode(text: &str) -> Result<Decoded, DecodeError> {
     Ok(out)
 }
 
+/// The Polymarket market channel as an [`Exchange`]. The URLs default to
+/// production; tests point them at mock servers.
+#[derive(Debug, Clone)]
+pub struct Polymarket {
+    ws_url: String,
+    books_url: String,
+}
+
+impl Default for Polymarket {
+    fn default() -> Self {
+        Self::with_url(WS_URL)
+    }
+}
+
+impl Polymarket {
+    /// Production REST, websocket at `ws_url`.
+    pub fn with_url(ws_url: impl Into<String>) -> Self {
+        Self {
+            ws_url: ws_url.into(),
+            books_url: BOOKS_URL.to_owned(),
+        }
+    }
+
+    pub fn with_books_url(mut self, books_url: impl Into<String>) -> Self {
+        self.books_url = books_url.into();
+        self
+    }
+}
+
+impl Exchange for Polymarket {
+    fn name(&self) -> &'static str {
+        "polymarket"
+    }
+
+    fn ws_url(&self) -> &str {
+        &self.ws_url
+    }
+
+    fn ping_text(&self) -> &str {
+        PING
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            missing_book_means_empty: true,
+        }
+    }
+
+    fn codec(&self) -> Box<dyn Codec> {
+        Box::new(PolymarketCodec)
+    }
+
+    fn book_api(&self) -> Option<&dyn BookApi> {
+        Some(self)
+    }
+}
+
+/// Stateless: Polymarket sends absolute sizes and no sequence numbers.
+struct PolymarketCodec;
+
+impl Codec for PolymarketCodec {
+    fn encode_initial_subscribe(&mut self, symbols: &[String]) -> String {
+        encode_initial_subscribe(symbols)
+    }
+
+    fn encode_subscribe(&mut self, symbols: &[String]) -> String {
+        encode_subscribe(symbols)
+    }
+
+    fn encode_unsubscribe(&mut self, symbols: &[String]) -> String {
+        encode_unsubscribe(symbols)
+    }
+
+    fn decode(&mut self, text: &str) -> Result<Decoded, DecodeError> {
+        decode(text)
+    }
+}
+
+impl BookApi for Polymarket {
+    fn url(&self) -> &str {
+        &self.books_url
+    }
+
+    fn encode_request(&self, symbols: &[String]) -> String {
+        encode_books_request(symbols)
+    }
+
+    fn parse_response(&self, body: &str) -> Result<std::collections::HashMap<String, RestBook>, DecodeError> {
+        parse_books_response(body)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -383,6 +431,7 @@ mod tests {
                     side: Side::Buy,
                     price: 500_000,
                     quantity: 5_805_250_000,
+                    kind: LevelKind::Absolute,
                     exchange_ts: ts(1793822781094),
                     hash: Some("0fd0".into()),
                 },
@@ -391,6 +440,7 @@ mod tests {
                     side: Side::Sell,
                     price: 500_000,
                     quantity: 0,
+                    kind: LevelKind::Absolute,
                     exchange_ts: ts(1793822781094),
                     hash: Some("0fd1".into()),
                 },

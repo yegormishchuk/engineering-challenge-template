@@ -326,6 +326,7 @@ mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
     use engineering_challenge::Side;
+    use engineering_challenge::exchange::LevelKind;
 
     #[test]
     fn parses_port_range() {
@@ -348,6 +349,7 @@ mod tests {
             side: Side::Buy,
             price: 500_000,
             quantity: 7,
+            kind: LevelKind::Absolute,
             exchange_ts: Utc.timestamp_millis_opt(1_700_000_005_123).unwrap(),
             hash: Some("abc".into()),
         };
@@ -355,7 +357,7 @@ mod tests {
             csv_row(&c, 1_700_000_005_200_000, &e).unwrap(),
             "2,1,40002,1.2.3.4,1700000000000000,tok,abc,1700000005200000,1700000005123000"
         );
-        let no_hash = Event::Level { symbol: "tok".into(), side: Side::Buy, price: 1, quantity: 1, exchange_ts: Utc.timestamp_millis_opt(1_700_000_005_123).unwrap(), hash: None };
+        let no_hash = Event::Level { symbol: "tok".into(), side: Side::Buy, price: 1, quantity: 1, kind: LevelKind::Absolute, exchange_ts: Utc.timestamp_millis_opt(1_700_000_005_123).unwrap(), hash: None };
         assert!(csv_row(&c, 0, &no_hash).is_none());
     }
 }
