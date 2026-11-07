@@ -131,7 +131,8 @@ def main():
     if delays:
         p50 = delays[len(delays) // 2]
         p99 = delays[min(len(delays) - 1, int(len(delays) * 0.99))]
-        print(f"  max_queue_us over {len(delays)} connections: p50 {p50:,}  p99 {p99:,}  max {delays[-1]:,}")
+        few = f" (n={len(delays)} < 10: p99 is the max)" if len(delays) < 10 else ""
+        print(f"  max_queue_us over {len(delays)} connections: p50 {p50:,}  p99 {p99:,}  max {delays[-1]:,}{few}")
         if totals["frames"]:
             print(f"  mean queue delay per frame: {totals['queue_ms'] * 1000 / totals['frames']:.1f} us")
     # A recycle reconnects without counting a disconnect.

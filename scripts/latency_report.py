@@ -6,7 +6,7 @@ of a change counts. Not every socket sees every change, so every statistic is
 computed over the changes that socket (or subset) actually saw.
 
 usage: latency_report.py <csv> [--offset-ms X] [--k 1,2,4,8,16]
-                         [--window-mins 5] [--group-by port|ip|age]
+                         [--window-mins 5] [--group-by port|ip|age] [--sockets N]
 """
 import argparse
 import csv
@@ -54,8 +54,10 @@ def percentile(values, p):
     return v[lo] + (v[hi] - v[lo]) * (pos - lo)
 
 
-def sockets_of(changes):
-    return sorted({s for seen in changes.values() for s in seen})
+def sockets_of(changes, declared=0):
+    """Every socket with a row, plus sockets 0..declared-1 (a socket that saw
+    nothing writes no row)."""
+    return sorted({s for seen in changes.values() for s in seen} | set(range(declared)))
 
 
 def deltas_by_socket(changes):
@@ -79,27 +81,31 @@ def rel_to_earliest(seen, subset, offset_us):
 
 
 def absolute(seen, subset, offset_us):
-    """min recv over subset minus exchange time and clock offset."""
-    got = [seen[s].recv_us for s in subset if s in seen]
+    """min recv over subset minus that row's exchange time and the clock offset."""
+    got = [seen[s] for s in subset if s in seen]
     if not got:
         return None
-    exchange = next(iter(seen.values())).exchange_us
-    return min(got) - exchange - offset_us
+    best = min(got, key=lambda r: r.recv_us)
+    return best.recv_us - best.exchange_us - offset_us
 
 
 def best_of_k(changes, sockets, k, metric, offset_us=0, n=200, seed=1):
-    """Median over random k-subsets (all if fewer than n) of the p50 of metric. Returns (value, subsets used)."""
+    """Median over random k-subsets (all if fewer than n) of the p50 of metric.
+    Returns (value, subsets used, median share of changes the subset saw);
+    changes no socket of a subset saw are left out of its p50."""
     k = min(k, len(sockets))
     combos = list(itertools.combinations(sockets, k)) if _comb(len(sockets), k) <= n else None
     if combos is None:
         rng = random.Random(seed)
         combos = [tuple(rng.sample(sockets, k)) for _ in range(n)]
     p50s = []
+    covered = []
     for subset in combos:
         vals = [v for seen in changes.values() if (v := metric(seen, subset, offset_us)) is not None]
+        covered.append(len(vals) / len(changes))
         if vals:
             p50s.append(percentile(vals, 50))
-    return (statistics.median(p50s) if p50s else float("nan")), len(combos)
+    return (statistics.median(p50s) if p50s else float("nan")), len(combos), statistics.median(covered)
 
 
 def _comb(n, k):
@@ -119,21 +125,23 @@ def age_bucket(age_us):
 
 
 def stability(changes, window_mins):
-    """Fastest socket (lowest p50 of recv - earliest) per window, and the % of windows
-    whose fastest equals the previous window's."""
+    """Fastest socket (lowest p50 of recv - earliest) per non-empty window, and the % of
+    windows whose fastest equals the previous window's. Only adjacent windows are
+    compared: a window after an empty one has no previous. A tie in p50 goes to the
+    lowest socket id."""
     win = int(window_mins * MIN_US)
     per = defaultdict(lambda: defaultdict(list))
     for seen in changes.values():
         e = earliest(seen)
         for s, r in seen.items():
             per[e // win][s].append(r.recv_us - e)
-    fastest = []
-    for w in sorted(per):
-        fastest.append(min(per[w], key=lambda s: (percentile(per[w][s], 50), s)))
-    if len(fastest) < 2:
+    windows = sorted(per)
+    fastest = [min(per[w], key=lambda s: (percentile(per[w][s], 50), s)) for w in windows]
+    pairs = [(a, b) for (wa, a), (wb, b) in zip(zip(windows, fastest), zip(windows[1:], fastest[1:]))
+             if wb == wa + 1]
+    if not pairs:
         return fastest, float("nan")
-    same = sum(a == b for a, b in zip(fastest, fastest[1:]))
-    return fastest, 100 * same / (len(fastest) - 1)
+    return fastest, 100 * sum(a == b for a, b in pairs) / len(pairs)
 
 
 def group_deltas(changes, group_by):
@@ -152,7 +160,7 @@ def ms(us):
 
 def report(changes, args, out=sys.stdout):
     p = lambda *a: print(*a, file=out)
-    socks = sockets_of(changes)
+    socks = sockets_of(changes, args.sockets)
     offset_us = args.offset_ms * 1000
     total = len(changes)
     d = deltas_by_socket(changes)
@@ -168,22 +176,23 @@ def report(changes, args, out=sys.stdout):
     p("socket     seen  missed%   p50    p90    p99  first%")
     for s in socks:
         p(f"{s:>6} {len(d[s]):>8} {100 * missed_share(changes, s):>7.1f} {ms(percentile(d[s], 50)):>6} "
-          f"{ms(percentile(d[s], 90)):>6} {ms(percentile(d[s], 99)):>6} {100 * wins[s] / len(d[s]):>7.1f}")
+          f"{ms(percentile(d[s], 90)):>6} {ms(percentile(d[s], 99)):>6} "
+          f"{100 * wins[s] / len(d[s]) if d[s] else 0:>7.1f}")
 
     ks = [int(x) for x in args.k.split(",")]
     p("\n2. best of k (median over random k-subsets of p50, ms)")
-    p("     k  subsets  vs_earliest  vs_exchange(offset %.1f ms)" % args.offset_ms)
+    p(f"     k  subsets  covered%  vs_earliest  vs_exchange(offset {args.offset_ms:.1f} ms)")
     for k in ks:
         if k > len(socks):
             continue
-        rel, n = best_of_k(changes, socks, k, rel_to_earliest)
-        ab, _ = best_of_k(changes, socks, k, absolute, offset_us)
-        p(f"{k:>6} {n:>8} {ms(rel):>12} {ms(ab):>12}")
+        rel, n, covered = best_of_k(changes, socks, k, rel_to_earliest)
+        ab, _, _ = best_of_k(changes, socks, k, absolute, offset_us)
+        p(f"{k:>6} {n:>8} {100 * covered:>9.1f} {ms(rel):>12} {ms(ab):>12}")
 
     fastest, same = stability(changes, args.window_mins)
     p(f"\n3. stability, {args.window_mins:g}-minute windows: {len(fastest)} windows")
     p("fastest by p50: " + " ".join(map(str, fastest)))
-    p(f"same fastest as previous window: {same:.1f}%")
+    p(f"same fastest as previous (adjacent) window: {same:.1f}%")
 
     if args.group_by:
         g = group_deltas(changes, args.group_by)
@@ -208,6 +217,8 @@ def main():
     ap.add_argument("--k", default="1,2,4,8,16")
     ap.add_argument("--window-mins", type=float, default=5)
     ap.add_argument("--group-by", choices=["port", "ip", "age"])
+    ap.add_argument("--sockets", type=int, default=0,
+                    help="the probe's socket count: sockets 0..N-1 are listed even with no rows")
     args = ap.parse_args()
     changes = dedupe(load(args.csv))
     if not changes:

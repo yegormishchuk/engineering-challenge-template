@@ -13,6 +13,7 @@ import socket
 import statistics
 import struct
 import subprocess
+import sys
 import time
 
 NTP_EPOCH = 2208988800  # seconds from 1900 to 1970
@@ -21,6 +22,18 @@ NTP_EPOCH = 2208988800  # seconds from 1900 to 1970
 def ntp_time(data, i):
     sec, frac = struct.unpack("!II", data[i:i + 8])
     return sec - NTP_EPOCH + frac / 2**32
+
+
+def server_times(data):
+    """(receive, transmit) server times of a reply; ValueError if it is not usable."""
+    if len(data) < 48:
+        raise ValueError(f"short reply ({len(data)} bytes)")
+    if data[1] == 0:
+        code = data[12:16].decode("ascii", "replace")
+        raise ValueError(f"kiss-of-death (stratum 0, {code!r})")
+    if data[40:48] == bytes(8):
+        raise ValueError("zero transmit timestamp")
+    return ntp_time(data, 32), ntp_time(data, 40)
 
 
 def sample(server):
@@ -32,7 +45,7 @@ def sample(server):
         s.sendto(packet, (server, 123))
         data, _ = s.recvfrom(512)
         t3 = time.time()
-    t1, t2 = ntp_time(data, 32), ntp_time(data, 40)  # server receive, transmit
+    t1, t2 = server_times(data)
     return ((t0 - t1) + (t3 - t2)) / 2, (t3 - t0) - (t2 - t1)
 
 
@@ -46,8 +59,8 @@ def main():
     for _ in range(args.samples):
         try:
             results.append(sample(server))
-        except OSError as e:
-            print(f"sample failed: {e}")
+        except (OSError, ValueError) as e:
+            print(f"sample failed: {e}", file=sys.stderr)
         time.sleep(0.2)
     if not results:
         raise SystemExit("no NTP replies")

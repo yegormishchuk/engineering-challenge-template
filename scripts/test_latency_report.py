@@ -1,4 +1,6 @@
+import argparse
 import importlib.util
+import io
 import os
 import unittest
 
@@ -47,6 +49,36 @@ class ReportTests(unittest.TestCase):
         # both sockets: min recv equals earliest everywhere
         self.assertEqual(lr.best_of_k(changes, [0, 1], 2, lr.rel_to_earliest)[0], 0)
 
+    def test_best_of_k_reports_the_share_of_changes_covered(self):
+        # socket 0 saw x and y, socket 1 only z: each single socket covers 2/3 or 1/3.
+        changes = lr.dedupe([row(0, "s", "x", 100), row(0, "s", "y", 200), row(1, "s", "z", 300)])
+        self.assertAlmostEqual(lr.best_of_k(changes, [0], 1, lr.rel_to_earliest)[2], 2 / 3)
+        self.assertAlmostEqual(lr.best_of_k(changes, [1], 1, lr.rel_to_earliest)[2], 1 / 3)
+        self.assertEqual(lr.best_of_k(changes, [0, 1], 2, lr.rel_to_earliest)[2], 1)
+
+    def test_absolute_uses_the_exchange_time_of_the_fastest_row(self):
+        seen = lr.dedupe([row(0, "s", "x", 110, exchange_ms=50), row(1, "s", "x", 100, exchange_ms=90)])[("s", "x")]
+        self.assertEqual(lr.absolute(seen, [0, 1], 0), 10 * MS)
+        self.assertEqual(lr.absolute(seen, [0], 2 * MS), 58 * MS)
+
+    def test_a_socket_without_rows_is_listed_as_missing_everything(self):
+        changes = lr.dedupe([row(0, "s", "x", 100), row(1, "s", "x", 105)])
+        self.assertEqual(lr.sockets_of(changes), [0, 1])
+        self.assertEqual(lr.sockets_of(changes, 3), [0, 1, 2])
+        args = argparse.Namespace(offset_ms=0.0, k="1,2", window_mins=5, group_by=None, sockets=3)
+        out = io.StringIO()
+        lr.report(changes, args, out)
+        line = next(l for l in out.getvalue().splitlines() if l.split()[:2] == ["2", "0"])
+        self.assertEqual(line.split()[2], "100.0")
+
+    def test_age_bucket_boundaries(self):
+        self.assertEqual(lr.age_bucket(5 * MIN - 1), "<5m")
+        self.assertEqual(lr.age_bucket(5 * MIN), "5-30m")
+        self.assertEqual(lr.age_bucket(30 * MIN - 1), "5-30m")
+        self.assertEqual(lr.age_bucket(30 * MIN), "30-60m")
+        self.assertEqual(lr.age_bucket(60 * MIN - 1), "30-60m")
+        self.assertEqual(lr.age_bucket(60 * MIN), ">60m")
+
     def test_age_buckets(self):
         self.assertEqual(lr.age_bucket(1 * MIN), "<5m")
         self.assertEqual(lr.age_bucket(20 * MIN), "5-30m")
@@ -69,6 +101,21 @@ class ReportTests(unittest.TestCase):
         fastest, same_pct = lr.stability(changes, 1)
         self.assertEqual(fastest, [0, 0, 1])
         self.assertEqual(same_pct, 50.0)
+
+    def test_stability_skips_pairs_across_an_empty_window(self):
+        # windows 0, 1 and 3 (2 is empty): only 0-1 is a pair, and it differs.
+        rows = []
+        for w, (fast, slow) in [(0, (0, 1)), (1, (1, 0)), (3, (1, 0))]:
+            t = w * 60_000
+            rows.append(row(fast, "s", f"h{w}", t + 1000))
+            rows.append(row(slow, "s", f"h{w}", t + 1010))
+        fastest, same_pct = lr.stability(lr.dedupe(rows), 1)
+        self.assertEqual(fastest, [0, 1, 1])
+        self.assertEqual(same_pct, 0.0)
+
+    def test_stability_breaks_ties_by_lowest_socket(self):
+        changes = lr.dedupe([row(1, "s", "x", 1000), row(0, "s", "x", 1000)])
+        self.assertEqual(lr.stability(changes, 1)[0], [0])
 
 
 if __name__ == "__main__":
