@@ -10,6 +10,8 @@
 # markets. Each run takes an NTP sample before and after (<name>.ntp) and
 # appends the eth0 receive rate to <name>.err. Run nothing else on the same
 # IP meanwhile (no collector): the link is only ~3-5 MB/s.
+# With `set -e`, a failed NTP call or a probe exiting non-zero stops the
+# whole chain; later runs and the reports are then not made.
 #
 # Files in ~/runs/: <name>.csv (one row per change per socket), .err
 # (per-socket counters, reconnects, rx_kBps), .ntp, .report.

@@ -11,8 +11,11 @@ Short answer: on this host the fastest of several sockets beats a single
 socket by only 3.7 ms at the median in a normal run (19 ms in a degraded
 one), but by hundreds of milliseconds to seconds in the tail, and it also
 protects completeness. No source port, server IP or connection age gave a
-stable gain. The biggest limit is the host's bandwidth, not the choice of
-connection.
+stable gain. The biggest limit appears to be the host's bandwidth, not
+the choice of connection. That is an inference from the collector runs,
+not a probe measurement: the collector never got above ~4.8–5.1 MB/s, a
+CDN download test reached 3.0 MB/s, and at full scale PONGs came up to
+47.6 s late (see [Bandwidth](#bandwidth)).
 
 ## Setup
 
@@ -22,7 +25,7 @@ connection.
 | Server | CloudFront in front of Polymarket: `getent ahosts` gave 4 IPv4 addresses per lookup (`13.227.65.{9,34,63,109}` for L1/L3, `13.226.209.{109,112,124,125}` for L2/L4; DNS answers changed between runs) |
 | Probe | `src/bin/latency.rs` at commit `9a45757`, copied to `~/runs/latency-9a45757`. Later commits changed only token picking (`--tokens` now limits a `--tokens-file`; Gamma tokens are deduplicated); the runs here pass `--tokens-file` without `--tokens`, so they behave the same at HEAD |
 | Tokens | 40 tokens, the top tradable markets by 24 h volume from Gamma at 2026-11-07 05:03 UTC, picked by the budget probe and reused by every run (`lat-budget.csv.tokens`, same md5 in every run) |
-| Clock | WSL system clock; offset measured with `scripts/ntp_offset.py --server time.google.com` (SNTP, 8 samples, median) before and after each run |
+| Clock | WSL system clock; offset measured with `scripts/ntp_offset.py --server time.google.com` (SNTP, 8 requested, 7 answered where one timed out; median) before and after each run |
 | Dates | 2026-11-07, 05:03–08:37 UTC (smoke run 2026-11-06 ~23:20 UTC) |
 | Driver | `scripts/latency_runs.sh` (all runs, one after another, nothing else on the IP) |
 
@@ -63,6 +66,12 @@ rows/s) and the ~2.3–2.5 rows per kB of the other runs, L4 was about
 The rule used for every decision below: a technique counts as a gain only if it
 improves the median recv − earliest by **at least 20 ms** and the same
 setting is fastest in **at least 80 %** of the 5-minute windows.
+
+The rule uses recv − earliest, not `vs_exchange` (recv − exchange
+timestamp). `vs_exchange` mixes in the clock offset, which is uncertain
+by about ±70 ms and drifted ~190 ms across the runs (L5), and the
+exchange's own publishing delay; recv − earliest compares arrivals on one
+clock only.
 
 ## L1: best of N sockets ("spamming connections")
 
@@ -366,7 +375,10 @@ and 7.8 GB).
 - **Best of N** mattered more in this bad run: a single socket was 19.03
   ms behind at the median and saw only 94.1 % of the changes; 2 sockets
   4.54 ms / 95.8 %, 16 sockets 100 %. On `vs_exchange` the gain from 1 to
-  16 sockets is 61.8 ms (548.14 → 486.31).
+  16 sockets is 61.8 ms (548.14 → 486.31). That is consistent with the
+  tail cut, but not usable for the rule: `vs_exchange` carries the clock
+  offset and the exchange's publishing delay (see
+  [Decision rule](#decision-rule)).
 - **Verdict:** no gain from connection age or from reconnecting
   regularly. Refreshing did not reduce misses either: refreshed sockets
   missed 4.4–7.4 % of the changes, never-refreshed ones 3.4–12.9 %.
@@ -428,11 +440,14 @@ link"), but they set the limit for every technique above.
 - The top 200 tokens alone are ~440 KB/s per socket, so even a modest
   best-of-N over the busiest markets multiplies a large stream.
 
-**Conclusion.** When the link is full, every socket queues behind it and
-no choice of port, IP or socket helps; latency is then set by the
-bandwidth. For latency on this host, the first lever is a host with more
-bandwidth close to the CloudFront edge (e.g. a cloud VM in the same
-region), not a cleverer connection.
+**Conclusion.** This is an inference from the collector runs above (a
+~4.8–5.1 MB/s cap, a 3.0 MB/s CDN test, PONGs up to 47.6 s late at full
+scale), not something the probe measured: the probe stayed at ~1–2 MB/s
+on purpose. When the link is full, every socket queues behind it and no
+choice of port, IP or socket can help; latency is then set by the
+bandwidth. So for latency on this host the first lever appears to be a
+host with more bandwidth close to the CloudFront edge (e.g. a cloud VM in
+the same region), not a cleverer connection.
 
 ## What helped / what did not
 
@@ -440,12 +455,12 @@ Gains are medians of recv − earliest; "stable" is the 80 % window rule.
 
 | Technique | p50 gain (ms) | Tail gain | Stable | Verdict |
 | --- | --- | --- | --- | --- |
-| Best of N sockets (L1, L4) | L1: 3.3 (k 1→2), 3.7 (k 1→16), `vs_exchange` 16.8; L4: 14.5 (k 1→2), 19.0 (k 1→16), `vs_exchange` 61.8 | Large: single-socket p99 0.5–4.7 s (L1), 23–174 s (L4) → 0 with all 16; also covers changes one socket misses (≤ 1 % in L1, 3–13 % in L4, 46 % on one smoke socket) | No single fastest socket (57 % of windows) | Below the median bar; useful for tail and completeness, as "take the first arrival" / switch away from a lagging socket |
+| Best of N sockets (L1, L4) | L1: 3.3 (k 1→2), 3.7 (k 1→16), `vs_exchange` 16.8; L4: 14.5 (k 1→2), 19.0 (k 1→16), `vs_exchange` 61.8 | Large: single-socket p99 0.5–4.7 s (L1), 23–174 s (L4) → 0 with all 16; also covers changes one socket misses (≤ 1 % in L1, 3–13 % in L4, 46 % on one smoke socket) | No single fastest socket (57 % of windows) | Below the median bar (`vs_exchange` gains carry the clock offset, not used for the rule); useful for tail and completeness, as "take the first arrival" / switch away from a lagging socket |
 | Source port (L2) | 3.8 (lo), 9.5 (hi), best port vs median socket | None attributable to the port; slow sockets were scattered | No (75 %, 75 %) | No gain |
 | Server IP (L3) | ≤ 1.3 between IPs | None; p99 differences came from single sockets | No (57 %) | No gain |
 | Connection age (L4) | none: < 5 min 18.57 vs 5–30 min 18.84 | None; the tail was set by server-side drops on old and fresh sockets alike | No (refreshed group 72 % of windows) | No gain |
 | Clock correction (L5) | n/a (changes the absolute number by the offset, 109–296 ms) | n/a | Offset drifted ~190 ms in 1.5 h | Needed for absolute latency; comparisons use recv − earliest |
-| More bandwidth near the edge | not measured | — | — | Expected main lever (link full at ~5 MB/s) |
+| More bandwidth near the edge | not measured | — | — | Appears to be the main lever (inferred from collector runs: cap ~4.8–5.1 MB/s, PONGs up to 47.6 s late) |
 
 ## Applied to the collector
 
@@ -453,7 +468,8 @@ Per technique, against the rule (≥ 20 ms median gain and the same
 setting fastest in ≥ 80 % of 5-minute windows):
 
 - **Best of N:** does not pass the median bar (3.7 ms in L1, 19.0 ms in
-  L4) nor the window bar (no socket fastest in more than 57 % of
+  L4; the 61.8 ms `vs_exchange` gain in L4 fits the tail cut but is not
+  the rule metric, since it carries the clock offset) nor the window bar (no socket fastest in more than 57 % of
   windows), but it is the technique that helps (tail, completeness). No new code: Extension 1
   already does this. `--redundancy` (default 2) keeps several
   connections on the same tokens; the source hands over when it loses
