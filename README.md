@@ -289,6 +289,31 @@ frames are processed.
 
 **Memory.** The collector uses jemalloc: glibc malloc fragmented badly
 across tokio's threads (about 7 KB per token against ~2 KB of live data).
+RSS is not the live heap. With redundancy 2 and recycling at 25,000 markets
+(50,000 tokens, 20 sockets), RSS climbed from 426 MB to 904 MB over 90 min,
+but it is not a leak. A 15-min run with the same flags, a full discovery
+pass every 5 min and a recycle every 45 s (17 recycles, 2 passes) logged
+jemalloc's own counts:
+
+- The allocated heap went back to ~290 MB after each pass (passes peak at
+  +190 MB while 412k Gamma markets are parsed). Over 16 recycles at 5,000
+  markets it stayed at 145 MB.
+- jemalloc's resident memory stayed at 355–380 MB between passes. RSS rose
+  from 445 to 560 MB.
+
+The gap is transparent huge pages. WSL2 sets `transparent_hugepage=always`,
+so the kernel backs a 2 MB range with one huge page on its first touch:
+touching one byte per 2 MB of a 128 MB mapping costs 126 MB of RSS. As the
+heap spreads over more 2 MB ranges after the bursts (discovery passes,
+book bursts after reconnects), more of them become huge pages that jemalloc
+counts as mostly empty. The jemalloc-mapped address space bounds this, not
+the run length. In the 90-min run RSS stayed flat at ~915 MB for the last
+10 min, under a 1.1 GB high-water mark set by the passes.
+
+What does grow with load is bounded by time. The redundancy loss check
+keeps one record per change for 35 s plus the reader's PONG lag: about
+150–175k records at 25,000 markets. Its hash map keeps its peak capacity,
+~465k slots (~40 MB).
 
 **Time stamps.** The receive time of a frame is taken when the reader task
 reads it from the socket, not when the connection processes it; the delay
