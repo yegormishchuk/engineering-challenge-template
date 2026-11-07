@@ -1,8 +1,12 @@
 import argparse
+import csv
 import importlib.util
 import io
 import os
+import random
+import tempfile
 import unittest
+from collections import defaultdict
 
 _path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "latency_report.py")
 _spec = importlib.util.spec_from_file_location("latency_report", _path)
@@ -27,9 +31,8 @@ class ReportTests(unittest.TestCase):
         ]
         changes = lr.dedupe(rows)
         self.assertEqual(len(changes), 3)
-        d = lr.deltas_by_socket(changes)
-        self.assertEqual(sorted(d[0]), [0, 0, 10 * MS])
-        self.assertEqual(sorted(d[1]), [0, 0, 5 * MS])
+        self.assertEqual(lr.socket_deltas(changes, 0), [0, 0, 10 * MS])
+        self.assertEqual(lr.socket_deltas(changes, 1), [0, 0, 5 * MS])
 
     def test_best_of_k_ignores_changes_a_socket_never_saw(self):
         rows = [
@@ -116,6 +119,48 @@ class ReportTests(unittest.TestCase):
     def test_stability_breaks_ties_by_lowest_socket(self):
         changes = lr.dedupe([row(1, "s", "x", 1000), row(0, "s", "x", 1000)])
         self.assertEqual(lr.stability(changes, 1)[0], [0])
+
+
+def reference_dedupe(rows):
+    """The original dict-of-dicts dedupe: {(symbol, hash): {socket: Row with the smallest recv_us}}"""
+    changes = defaultdict(dict)
+    for r in rows:
+        seen = changes[(r.symbol, r.hash)]
+        if r.socket not in seen or r.recv_us < seen[r.socket].recv_us:
+            seen[r.socket] = r
+    return changes
+
+
+class CompactLoadTests(unittest.TestCase):
+    def test_compact_load_matches_reference(self):
+        rng = random.Random(7)
+        rows = [lr.Row(rng.randrange(4), rng.randrange(3), 40000 + rng.randrange(3), f"10.0.0.{rng.randrange(2)}",
+                       rng.randrange(1000), f"sym{rng.randrange(3)}", f"h{rng.randrange(20)}",
+                       1_700_000_000_000_000 + rng.randrange(10**6), 1_699_999_999_000_000 + rng.randrange(10**3))
+                for _ in range(300)]
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "l.csv")
+            with open(path, "w", newline="") as f:
+                w = csv.writer(f)
+                w.writerow("socket,session,local_port,remote_ip,connected_us,symbol,hash,recv_us,exchange_us".split(","))
+                w.writerows(rows)
+            new = lr.load_changes(path)
+        ref = reference_dedupe(rows)
+        self.assertEqual(len(new), len(ref))
+        for key, seen in ref.items():
+            self.assertEqual(new[key], seen)
+        self.assertEqual(lr.sockets_of(new), sorted({s for seen in ref.values() for s in seen}))
+        for s in range(5):
+            self.assertEqual(lr.socket_deltas(new, s), sorted(r.recv_us - min(x.recv_us for x in seen.values())
+                                                              for seen in ref.values() for r in [seen.get(s)] if r))
+
+    def test_absolute_when_exchange_times_differ_between_sockets(self):
+        # same change, different exchange_us per socket: the fastest row's own exchange time counts.
+        changes = lr.dedupe([row(0, "s", "x", 110, exchange_ms=50), row(1, "s", "x", 100, exchange_ms=90),
+                             row(0, "s", "y", 200, exchange_ms=150), row(1, "s", "y", 230, exchange_ms=150)])
+        self.assertFalse(changes.uniform)
+        # x: 100 - 90 = 10ms; y: 200 - 150 = 50ms -> p50 30ms
+        self.assertEqual(lr.best_of_k(changes, [0, 1], 2, lr.absolute)[0], 30 * MS)
 
 
 if __name__ == "__main__":
